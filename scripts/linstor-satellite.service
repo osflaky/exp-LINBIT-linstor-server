@@ -1,0 +1,24 @@
+[Unit]
+Description=LINSTOR Satellite Service
+Wants=network-online.target
+After=network-online.target
+# if these exist, and are enabled, we want to be scheduled before them
+# proxmox:
+Before=pvedaemon.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/share/linstor-server/bin/Satellite --logs=/var/log/linstor-satellite --config-directory=/etc/linstor
+# send SIGTERM only to satellite, send SIGKILL to all spawned processes
+KillMode=mixed
+# if killed by signal 143 -> SIGTERM, 129 -> SIGHUP
+SuccessExitStatus=0 143 129
+# 70 -> critical error(e.g.: uuid mismatch)
+RestartForceExitStatus=70
+User=root
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

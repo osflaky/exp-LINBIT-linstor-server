@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package com.linbit.linstor.proto.javainternal;
+
+import "common/ids/Uuid.proto";
+
+// Internal message containing a linstore object identifier
+message IntObjectId
+{
+    // Linstor object name (node, resource, storPool, ...)
+    string name = 1;
+
+    // UUID
+    common.ids.Uuid uuid = 2;
+}

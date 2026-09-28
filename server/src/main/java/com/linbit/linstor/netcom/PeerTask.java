@@ -1,0 +1,413 @@
+package com.linbit.linstor.netcom;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.ServiceName;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.ApiConsts.ConnectionStatus;
+import com.linbit.linstor.api.prop.Property;
+import com.linbit.linstor.core.cfg.StltConfig;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.satellitestate.SatelliteState;
+import com.linbit.linstor.utils.externaltools.ExtToolsManager;
+
+import javax.net.ssl.SSLException;
+
+import java.io.ByteArrayInputStream;
+import java.net.InetSocketAddress;
+import java.util.List;
+import java.util.concurrent.locks.ReadWriteLock;
+
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+
+public class PeerTask implements Peer
+{
+    private final String peerId;
+    static final ServiceName serviceName;
+    static
+    {
+        try
+        {
+            serviceName = new ServiceName("PeerTask");
+        }
+        catch (InvalidNameException exc)
+        {
+            throw new ExceptionInInitializerError(exc);
+        }
+    }
+    private final ExtToolsManager extToolsMgr;
+
+    public PeerTask(
+        String peerIdRef
+    )
+    {
+        peerId = peerIdRef;
+        extToolsMgr = new ExtToolsManager();
+    }
+
+    @Override
+    public String getId()
+    {
+        return peerId;
+    }
+
+    @Nullable
+    @Override
+    public InetSocketAddress getHostAddr()
+    {
+        return null;
+    }
+
+    @Override
+    public @Nullable Node getNode()
+    {
+        return null;
+    }
+
+    @Override
+    public ServiceName getConnectorInstanceName()
+    {
+        return serviceName;
+    }
+
+    @Override
+    public void attach(Object attachmentRef)
+    {
+    }
+
+    @Override
+    public @Nullable Object getAttachment()
+    {
+        return null;
+    }
+
+    @Override
+    public @Nullable Message createMessage()
+    {
+        return null;
+    }
+
+    @Override
+    public boolean sendMessage(Message msgRef) throws IllegalMessageStateException
+    {
+        return false;
+    }
+
+    @Override
+    public boolean sendMessage(byte[] dataRef)
+    {
+        return false;
+    }
+
+    @Override
+    public long getNextIncomingMessageSeq()
+    {
+        return 0;
+    }
+
+    @Override
+    public void processInOrder(long peerSeqRef, Publisher<?> publisherRef)
+    {
+    }
+
+    @Override
+    public Flux<ByteArrayInputStream> apiCall(String apiCallNameRef, byte[] dataRef)
+    {
+        return Flux.empty();
+    }
+
+    @Override
+    public void apiCallAnswer(long apiCallIdRef, ByteArrayInputStream dataRef)
+    {
+    }
+
+    @Override
+    public void apiCallError(long apiCallIdRef, Throwable excRef)
+    {
+    }
+
+    @Override
+    public void apiCallComplete(long apiCallIdRef)
+    {
+    }
+
+    @Override
+    public void setAllowReconnect(boolean ignoredAllowReconnectRef)
+    {
+    }
+
+    @Override
+    public boolean isAllowReconnect()
+    {
+        return false;
+    }
+
+    @Override
+    public void closeConnection()
+    {
+    }
+
+    @Override
+    public void closeConnection(boolean allowReconnectRef)
+    {
+    }
+
+    @Override
+    public void connectionClosing()
+    {
+    }
+
+    @Override
+    public boolean isOnline()
+    {
+        return false;
+    }
+
+    @Override
+    public ConnectionStatus getConnectionStatus()
+    {
+        return ApiConsts.ConnectionStatus.UNKNOWN;
+    }
+
+    @Override
+    public void setConnectionStatus(ConnectionStatus statusRef)
+    {
+    }
+
+    @Override
+    public @Nullable ApiConsts.Platform getPlatform()
+    {
+        return null;
+    }
+
+    @Override
+    public void setPlatform(@Nullable ApiConsts.Platform platform)
+    {
+    }
+
+    @Override
+    public @Nullable String getOsVariant()
+    {
+        return null;
+    }
+
+    @Override
+    public void setOsVariant(@Nullable String osVariant)
+    {
+    }
+
+    @Override
+    public boolean isConnected(boolean ensureAuthenticatedRef)
+    {
+        return false;
+    }
+
+    @Override
+    public boolean isAuthenticated()
+    {
+        return false;
+    }
+
+    @Override
+    public void setAuthenticated(boolean authenticatedRef)
+    {
+    }
+
+    @Override
+    public int outQueueCapacity()
+    {
+        return 0;
+    }
+
+    @Override
+    public int outQueueCount()
+    {
+        return 0;
+    }
+
+    @Override
+    public long msgSentCount()
+    {
+        return 0;
+    }
+
+    @Override
+    public long msgRecvCount()
+    {
+        return 0;
+    }
+
+    @Override
+    public long msgSentMaxSize()
+    {
+        return 0;
+    }
+
+    @Override
+    public long msgRecvMaxSize()
+    {
+        return 0;
+    }
+
+    @Override
+    public @Nullable InetSocketAddress peerAddress()
+    {
+        return null;
+    }
+
+    @Override
+    public @Nullable InetSocketAddress localAddress()
+    {
+        return null;
+    }
+
+    @Override
+    public void connectionEstablished() throws SSLException
+    {
+    }
+
+    @Override
+    public void waitUntilConnectionEstablished() throws InterruptedException
+    {
+    }
+
+    @Override
+    public @Nullable TcpConnector getConnector()
+    {
+        return null;
+    }
+
+    @Override
+    public void sendPing()
+    {
+    }
+
+    @Override
+    public void sendPong()
+    {
+    }
+
+    @Override
+    public void pongReceived()
+    {
+    }
+
+    @Override
+    public long getLastPingSent()
+    {
+        return 0;
+    }
+
+    @Override
+    public long getLastPongReceived()
+    {
+        return 0;
+    }
+
+    @Override
+    public @Nullable ReadWriteLock getSatelliteStateLock()
+    {
+        return null;
+    }
+
+    @Override
+    public @Nullable SatelliteState getSatelliteState()
+    {
+        return null;
+    }
+
+    @Override
+    public @Nullable ReadWriteLock getSerializerLock()
+    {
+        return null;
+    }
+
+    @Override
+    public void setFullSyncId(long timestampRef)
+    {
+    }
+
+    @Override
+    public long getFullSyncId()
+    {
+        return 0;
+    }
+
+    @Override
+    public long getNextSerializerId()
+    {
+        return 0;
+    }
+
+    @Override
+    public void fullSyncFailed(ApiConsts.ConnectionStatus ignored)
+    {
+    }
+
+    @Override
+    public boolean hasFullSyncFailed()
+    {
+        return true;
+    }
+
+    @Override
+    public void fullSyncApplied()
+    {
+        throw new ImplementationError("Fullsync cannot have been applied to a task peer");
+    }
+
+    @Override
+    public boolean isFullSyncApplied()
+    {
+        return false;
+    }
+
+    @Override
+    public boolean hasNextMsgIn()
+    {
+        return false;
+    }
+
+    @Override
+    public @Nullable Message nextCurrentMsgIn()
+    {
+        return null;
+    }
+
+    @Override
+    public ExtToolsManager getExtToolsManager()
+    {
+        return extToolsMgr;
+    }
+
+    @Override
+    public @Nullable StltConfig getStltConfig()
+    {
+        return null;
+    }
+
+    @Override
+    public void setStltConfig(StltConfig stltConfigRef)
+    {
+    }
+
+    @Override
+    public void setDynamicProperties(List<Property> dynamicPropListRef)
+    {
+        // no-op
+    }
+
+    @Override
+    public @Nullable Property getDynamicProperty(String keyRef)
+    {
+        return null;
+    }
+
+    @Override
+    public String toString()
+    {
+        return serviceName + "(" + getId() + ")";
+    }
+}

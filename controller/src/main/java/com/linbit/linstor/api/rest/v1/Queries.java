@@ -1,0 +1,104 @@
+package com.linbit.linstor.api.rest.v1;
+
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.pojo.QueryAllSizeInfoResponsePojo;
+import com.linbit.linstor.api.rest.v1.serializer.Json;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscGrpApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.logging.ErrorReporter;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.Suspended;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.glassfish.grizzly.http.server.Request;
+import org.slf4j.MDC;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Path("v1/queries")
+@Produces(MediaType.APPLICATION_JSON)
+public class Queries
+{
+    private final RequestHelper requestHelper;
+    private final ObjectMapper objectMapper;
+    private final CtrlRscGrpApiCallHandler ctrlRscGrpApiCallHandler;
+
+    @Inject
+    Queries(
+        RequestHelper requestHelperRef,
+        CtrlRscGrpApiCallHandler ctrlRscGrpApiCallHandlerRef
+    )
+    {
+        requestHelper = requestHelperRef;
+        ctrlRscGrpApiCallHandler = ctrlRscGrpApiCallHandlerRef;
+
+        objectMapper = new ObjectMapper();
+    }
+
+    @POST
+    @Path("resource-groups/query-all-size-info")
+    public void resourceGroupsQueryAllSizeInfo(
+        @Context Request request,
+        @Suspended AsyncResponse asyncResponse,
+        @Nullable String jsonData
+    )
+        throws JsonProcessingException
+    {
+        JsonGenTypes.QueryAllSizeInfoRequest qasiReq = RequestHelper.parseJsonOrDefault(
+            objectMapper,
+            jsonData,
+            JsonGenTypes.QueryAllSizeInfoRequest.class,
+            JsonGenTypes.QueryAllSizeInfoRequest::new
+        );
+        RequestHelper.safeAsyncResponse(asyncResponse, () ->
+        {
+            MDC.put(ErrorReporter.LOGID, ErrorReporter.getNewLogId());
+            Mono<Response> flux = ctrlRscGrpApiCallHandler.queryAllSizeInfo(Json.queryAllSizeInfoReqToPojo(qasiReq))
+                .onErrorResume(
+                    ApiRcException.class,
+                    apiExc -> Flux.just(
+                        new QueryAllSizeInfoResponsePojo(null, apiExc.getApiCallRc())
+                    )
+                )
+                .flatMap(queryAllSizeInfoResult ->
+                {
+                    Response resp;
+                    JsonGenTypes.QueryAllSizeInfoResponse qasiResp = Json.pojoToQueryAllSizeInfoResp(
+                        queryAllSizeInfoResult
+                    );
+
+                    try
+                    {
+                        resp = Response
+                            .status(Response.Status.OK)
+                            .entity(objectMapper.writeValueAsString(qasiResp))
+                            .build();
+                    }
+                    catch (JsonProcessingException exc)
+                    {
+                        exc.printStackTrace();
+                        resp = Response.status(Response.Status.INTERNAL_SERVER_ERROR).build();
+                    }
+                    return Mono.just(resp);
+                })
+                .next();
+            requestHelper.doFlux(
+                ApiConsts.API_QRY_ALL_SIZE_INFO,
+                request,
+                asyncResponse,
+                flux
+            );
+        });
+    }
+}

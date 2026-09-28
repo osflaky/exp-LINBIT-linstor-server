@@ -1,0 +1,44 @@
+Source: linstor-server
+Maintainer: LINBIT HA Solutions GmbH <drbd-dev@lists.linux.dev>
+Uploaders: Rene Peinthor <rene.peinthor@linbit.com>
+Section: admin
+Priority: optional
+Build-Depends: debhelper (>= 11),
+               java-sdk-headless (>= 21),
+#               gradle (>= 6.8.3),
+               python3-all (>= 3.5)
+Standards-Version: 3.9.6
+
+Package: linstor-common
+Architecture: all
+Depends: ${misc:Depends},
+         java-runtime-headless (>= 21)
+Description: DRBD distributed resource management utility
+ This is the linstor common packages containing shared deps.
+
+Package: linstor-controller
+Architecture: all
+# Pre-Depends for the postinst script
+Pre-Depends: java-runtime-headless (>= 21)
+Depends: ${misc:Depends},
+         linstor-common (= ${binary:Version}),
+         tar,
+         libnss-systemd,
+Description: DRBD distributed resource management utility
+ LINSTOR controller manages the configuration of the LINSTOR cluster
+ and all of its managed storage resources.
+
+Package: linstor-satellite
+Architecture: all
+Depends: ${misc:Depends},
+         linstor-common (= ${binary:Version}),
+         tar,
+         thin-provisioning-tools
+Suggests: drbd-utils (>= 9.32.0),
+          socat,
+          zstd,
+          thin-send-recv
+Description: DRBD distributed resource management utility
+ LINSTOR satellite component manages creation, modification and deletion
+ of storage resources on each node that provides
+ or uses storage resources managed by LINSTOR.

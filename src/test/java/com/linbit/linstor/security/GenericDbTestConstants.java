@@ -1,0 +1,233 @@
+package com.linbit.linstor.security;
+
+public interface GenericDbTestConstants
+{
+    // Table names
+    String TBL_NODES                 = "NODES";
+    String TBL_NODE_NET_INTERFACES   = "NODE_NET_INTERFACES";
+    String TBL_SATELLITE_CONNECTIONS = "SATELLITE_CONNECTIONS";
+    String TBL_RESOURCE_DEFINITIONS  = "RESOURCE_DEFINITIONS";
+    String TBL_RESOURCE_GROUPS       = "RESOURCE_GROUPS";
+    String TBL_RESOURCES             = "RESOURCES";
+    String TBL_STOR_POOL_DEFINITIONS = "STOR_POOL_DEFINITIONS";
+    String TBL_NODE_STOR_POOL        = "NODE_STOR_POOL";
+    String TBL_VOLUME_DEFINITIONS    = "VOLUME_DEFINITIONS";
+    String TBL_VOLUME_GROUPS         = "VOLUME_GROUPS";
+    String TBL_VOLUMES               = "VOLUMES";
+    String TBL_NODE_CONNECTIONS      = "NODE_CONNECTIONS";
+    String TBL_RESOURCE_CONNECTIONS  = "RESOURCE_CONNECTIONS";
+    String TBL_VOLUME_CONNECTIONS    = "VOLUME_CONNECTIONS";
+    String TBL_PROPS_CONTAINERS      = "PROPS_CONTAINERS";
+    String TBL_KEY_VALUE_STORE       = "KEY_VALUE_STORE";
+    String TBL_FILES                 = "FILES";
+    String TBL_S3_REMOTES            = "S3_REMOTES";
+    String TBL_LINSTOR_REMOTES       = "LINSTOR_REMOTES";
+    String TBL_EBS_REMOTES           = "EBS_REMOTES";
+    String TBL_SCHEDULES             = "SCHEDULES";
+    String TBL_LAYER_LUKS_VOLUMES    = "LAYER_LUKS_VOLUMES";
+    String TBL_LAYER_DRBD_VOLUMES    = "LAYER_DRBD_VOLUMES";
+    String TBL_LAYER_DRBD_RESOURCES  = "LAYER_DRBD_RESOURCES";
+    String TBL_LAYER_DRBD_RESOURCE_DEFINITIONS = "LAYER_DRBD_RESOURCE_DEFINITIONS";
+    String TBL_LAYER_DRBD_VOLUME_DEFINITIONS = "LAYER_DRBD_VOLUME_DEFINITIONS";
+    String TBL_LAYER_RESOURCE_IDS    = "LAYER_RESOURCE_IDS";
+    String TBL_LAYER_STORAGE_VOLUMES = "LAYER_STORAGE_VOLUMES";
+    String TBL_LAYER_CACHE_VOLUMES = "LAYER_CACHE_VOLUMES";
+
+    String TBL_FLYWAY_SCHEMA_HISTORY = "FLYWAY_SCHEMA_HISTORY";
+
+    // NODES column names
+    String UUID          = "UUID";
+    String NODE_NAME     = "NODE_NAME";
+    String NODE_DSP_NAME = "NODE_DSP_NAME";
+    String NODE_FLAGS    = "NODE_FLAGS";
+    String NODE_TYPE     = "NODE_TYPE";
+
+    // NODE_NET_INTERFACES column names
+    String NODE_NET_NAME     = "NODE_NET_NAME";
+    String NODE_NET_DSP_NAME = "NODE_NET_DSP_NAME";
+    String INET_ADDRESS      = "INET_ADDRESS";
+
+    // RESOURCE_DEFINITIONS column names
+    String RESOURCE_NAME     = "RESOURCE_NAME";
+    String RESOURCE_DSP_NAME = "RESOURCE_DSP_NAME";
+    String RESOURCE_FLAGS    = "RESOURCE_FLAGS";
+    String SECRET            = "SECRET";
+    String TCP_PORT          = "TCP_PORT";
+    String TRANSPORT_TYPE    = "TRANSPORT_TYPE";
+    String LAYER_STACK       = "LAYER_STACK";
+
+    // RESOURCES column names
+    String NODE_ID        = "NODE_ID";
+
+    // STOR_POOL_DEFINITIONS column names
+    String POOL_NAME     = "POOL_NAME";
+    String POOL_DSP_NAME = "POOL_DSP_NAME";
+
+    // NODE_STOR_POOL column names
+    String DRIVER_NAME = "DRIVER_NAME";
+
+    // VOLUME_DEFINITIONS column names
+    String VLM_NR        = "VLM_NR";
+    String VLM_SIZE      = "VLM_SIZE";
+    String VLM_MINOR_NR  = "VLM_MINOR_NR";
+    String VLM_FLAGS     = "VLM_FLAGS";
+
+    // VOLUMES column names
+    String STOR_POOL_NAME    = "STOR_POOL_NAME";
+
+    // NODE_CONNECTIONS column names
+    String NODE_NAME_SRC = "NODE_NAME_SRC";
+    String NODE_NAME_DST = "NODE_NAME_DST";
+
+    // PROPS_CONTAINERS column names
+    String PROPS_INSTANCE = "PROPS_INSTANCE";
+    String PROP_KEY       = "PROP_KEY";
+    String PROP_VALUE     = "PROP_VALUE";
+
+    // table column counts
+    int TBL_COL_COUNT_NODES                 = 5;
+    int TBL_COL_COUNT_NODE_NET_INTERFACES   = 5;
+    int TBL_COL_COUNT_RESOURCE_DEFINITIONS  = 7;
+    int TBL_COL_COUNT_RESOURCES             = 5;
+    int TBL_COL_COUNT_STOR_POOL_DEFINITIONS = 3;
+    int TBL_COL_COUNT_NODE_STOR_POOL        = 4;
+    int TBL_COL_COUNT_VOLUME_DEFINITIONS    = 6;
+    int TBL_COL_COUNT_VOLUMES               = 8;
+    int TBL_COL_COUNT_NODE_CONNECTIONS      = 3;
+    int TBL_COL_COUNT_RESOURCE_CONNECTIONS  = 6;
+    int TBL_COL_COUNT_VOLUME_CONNECTIONS    = 5;
+    int TBL_COL_COUNT_PROPS_CONTAINERS      = 3;
+
+    // truncate statements
+    String TRUNCATE_KEY_VALUE_STORE = "DELETE FROM " + TBL_KEY_VALUE_STORE;
+    String TRUNCATE_LAYER_LUKS_VOLUMES    = "DELETE FROM " + TBL_LAYER_LUKS_VOLUMES;
+    String TRUNCATE_LAYER_CACHE_VOLUMES = "DELETE FROM " + TBL_LAYER_CACHE_VOLUMES;
+    String TRUNCATE_LAYER_DRBD_VOLUMES    = "DELETE FROM " + TBL_LAYER_DRBD_VOLUMES;
+    String TRUNCATE_LAYER_DRBD_RESOURCES  = "DELETE FROM " + TBL_LAYER_DRBD_RESOURCES;
+    String TRUNCATE_LAYER_DRBD_RESOURCE_DEFINITIONS = "DELETE FROM " + TBL_LAYER_DRBD_RESOURCE_DEFINITIONS;
+    String TRUNCATE_LAYER_DRBD_VOLUME_DEFINITIONS = "DELETE FROM " + TBL_LAYER_DRBD_VOLUME_DEFINITIONS;
+    String TRUNCATE_LAYER_RESOURCE_IDS = "DELETE FROM " + TBL_LAYER_RESOURCE_IDS;
+    String TRUNCATE_LAYER_STORAGE_VOLUMES = "DELETE FROM " + TBL_LAYER_STORAGE_VOLUMES;
+    String TRUNCATE_PROPS_CONTAINERS      = "DELETE FROM " + TBL_PROPS_CONTAINERS;
+    String TRUNCATE_VOLUME_CONNECTIONS    = "DELETE FROM " + TBL_VOLUME_CONNECTIONS;
+    String TRUNCATE_RESOURCE_CONNECTIONS  = "DELETE FROM " + TBL_RESOURCE_CONNECTIONS;
+    String TRUNCATE_NODE_CONNECTIONS      = "DELETE FROM " + TBL_NODE_CONNECTIONS;
+    String TRUNCATE_VOLUMES               = "DELETE FROM " + TBL_VOLUMES;
+    String TRUNCATE_VOLUME_DEFINITIONS    = "DELETE FROM " + TBL_VOLUME_DEFINITIONS;
+    String TRUNCATE_VOLUME_GROUPS         = "DELETE FROM " + TBL_VOLUME_GROUPS;
+    String TRUNCATE_NODE_STOR_POOL        = "DELETE FROM " + TBL_NODE_STOR_POOL;
+    String TRUNCATE_STOR_POOL_DEFINITIONS = "DELETE FROM " + TBL_STOR_POOL_DEFINITIONS;
+    String TRUNCATE_RESOURCES             = "DELETE FROM " + TBL_RESOURCES;
+    String TRUNCATE_RESOURCE_DEFINITIONS  = "DELETE FROM " + TBL_RESOURCE_DEFINITIONS;
+    String TRUNCATE_RESOURCE_GROUPS       = "DELETE FROM " + TBL_RESOURCE_GROUPS;
+    String TRUNCATE_NODE_NET_INTERFACES   = "DELETE FROM " + TBL_NODE_NET_INTERFACES;
+    String TRUNCATE_NODES                 = "DELETE FROM " + TBL_NODES;
+    String TRUNCATE_FILES                 = "DELETE FROM " + TBL_FILES;
+    String TRUNCATE_S3_REMOTES            = "DELETE FROM " + TBL_S3_REMOTES;
+    String TRUNCATE_LINSTOR_REMOTES       = "DELETE FROM " + TBL_LINSTOR_REMOTES;
+    String TRUNCATE_EBS_REMOTES           = "DELETE FROM " + TBL_EBS_REMOTES;
+    String TRUNCATE_SCHEDULES             = "DELETE FROM " + TBL_SCHEDULES;
+
+    // insert statements (default values)
+    String[] INSERT_DEFAULT_VALUES =
+    {
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/PlainConnector/type', 'plain')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/PlainConnector/bindaddress', '::0')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/PlainConnector/port', '3376')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/type', 'ssl')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/bindaddress', '::0')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/port', '3377')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/keyPasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/keyStorePasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/trustStorePasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/trustStore', 'ssl/certificates.jks')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/sslProtocol', 'TLSv1')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/SslConnector/keyStore', 'ssl/keystore.jks')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/type', 'ssl')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/bindaddress', '::0')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/port', '3373')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/keyPasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/keyStorePasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/trustStorePasswd', 'linstor')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/trustStore', 'ssl/certificates.jks')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/sslProtocol', 'TLSv1')",
+        "INSERT INTO PROPS_CONTAINERS VALUES ('CTRLCFG', 'netcom/DebugSslConnector/keyStore', 'ssl/keystore.jks')",
+        "INSERT INTO STOR_POOL_DEFINITIONS VALUES ('622807eb-c8c4-44f0-b03d-a08173c8fa1b', 'DFLTDISKLESSSTORPOOL', 'DfltDisklessStorPool')",
+        "INSERT INTO RESOURCE_GROUPS(UUID, RESOURCE_GROUP_NAME, RESOURCE_GROUP_DSP_NAME, REPLICA_COUNT)" +
+            "    VALUES ('a52e934a-9fd9-44cb-9db1-716dcd13aae3', 'DFLTRSCGRP', 'DfltRscGrp', 2)",
+    };
+
+    // insert statements (parameterized)
+    String INSERT_NODES =
+        " INSERT INTO " + TBL_NODES +
+        " VALUES (?, ?, ?, ?, ?)";
+    String INSERT_NODE_NET_INTERFACES =
+        " INSERT INTO " + TBL_NODE_NET_INTERFACES +
+        " VALUES (?, ?, ?, ?, ?)";
+    String INSERT_SATELLITE_CONNECTIONS =
+        " INSERT INTO " + TBL_SATELLITE_CONNECTIONS +
+        " VALUES (?, ?, ?, ?, ?)";
+    String INSERT_RESOURCE_DEFINITIONS =
+        " INSERT INTO " + TBL_RESOURCE_DEFINITIONS +
+        " VALUES (?, ?, ?, ?, ?, ?, ?)";
+    String INSERT_RESOURCES =
+        " INSERT INTO " + TBL_RESOURCES +
+        " VALUES (?, ?, ?, ?, ?)";
+    String INSERT_STOR_POOL_DEFINITIONS =
+        " INSERT INTO " + TBL_STOR_POOL_DEFINITIONS +
+        " VALUES (?, ?, ?)";
+    String INSERT_NODE_STOR_POOL =
+        " INSERT INTO " + TBL_NODE_STOR_POOL +
+        " VALUES (?, ?, ?, ?)";
+    String INSERT_VOLUME_DEFINITIONS =
+        " INSERT INTO " + TBL_VOLUME_DEFINITIONS +
+        " VALUES (?, ?, ?, ?, ?, ?)";
+    String INSERT_VOLUMES =
+        " INSERT INTO " + TBL_VOLUMES +
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+    String INSERT_NODE_CONNECTIONS =
+        " INSERT INTO " + TBL_NODE_CONNECTIONS +
+        " VALUES (?, ?, ?)";
+    String INSERT_RESOURCE_CONNECTIONS =
+        " INSERT INTO " + TBL_RESOURCE_CONNECTIONS +
+        " VALUES (?, ?, ?, ?)";
+    String INSERT_VOLUME_CONNECTIONS =
+        " INSERT INTO " + TBL_VOLUME_CONNECTIONS +
+        " VALUES (?, ?, ?, ?, ?)";
+    String INSERT_PROPS_CONTAINERS =
+        " INSERT INTO " + TBL_PROPS_CONTAINERS +
+        " VALUES (?, ?, ?)";
+
+    // truncate statement array
+    String[] TRUNCATE_TABLES =
+    {
+        TRUNCATE_LAYER_LUKS_VOLUMES,
+        TRUNCATE_LAYER_CACHE_VOLUMES,
+        TRUNCATE_LAYER_DRBD_VOLUMES,
+        TRUNCATE_LAYER_DRBD_RESOURCES,
+        TRUNCATE_LAYER_DRBD_RESOURCE_DEFINITIONS,
+        TRUNCATE_LAYER_DRBD_VOLUME_DEFINITIONS,
+        TRUNCATE_LAYER_STORAGE_VOLUMES,
+        TRUNCATE_LAYER_RESOURCE_IDS,
+        TRUNCATE_PROPS_CONTAINERS,
+        TRUNCATE_VOLUME_CONNECTIONS,
+        TRUNCATE_RESOURCE_CONNECTIONS,
+        TRUNCATE_NODE_CONNECTIONS,
+        TRUNCATE_VOLUMES,
+        TRUNCATE_VOLUME_DEFINITIONS,
+        TRUNCATE_VOLUME_GROUPS,
+        TRUNCATE_NODE_STOR_POOL,
+        TRUNCATE_STOR_POOL_DEFINITIONS,
+        TRUNCATE_RESOURCES,
+        TRUNCATE_RESOURCE_DEFINITIONS,
+        TRUNCATE_RESOURCE_GROUPS,
+        TRUNCATE_NODE_NET_INTERFACES,
+        TRUNCATE_NODES,
+        TRUNCATE_FILES,
+        TRUNCATE_S3_REMOTES,
+        TRUNCATE_LINSTOR_REMOTES,
+        TRUNCATE_EBS_REMOTES,
+        TRUNCATE_SCHEDULES,
+        TRUNCATE_KEY_VALUE_STORE,
+    };
+}

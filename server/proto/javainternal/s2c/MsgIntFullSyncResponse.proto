@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package com.linbit.linstor.proto.javainternal.s2c;
+import "common/StorPoolFreeSpace.proto";
+import "common/CryptoEntry.proto";
+
+// Internal message indicating the success of full sync
+// If the full sync was successful, this message will also contain the free space for each storage pool of the satellite
+message MsgIntFullSyncResponse
+{
+    FullSyncResult full_sync_result = 1;
+
+    // A List of FreeSpace messages. Empty if full sync failed
+    repeated common.StorPoolFreeSpace free_space = 2;
+
+    repeated common.CryptoEntry crypto_entries = 3;
+
+    // currently properties only change due to satellite migrations, which is the reason we do not include (yet) prop-changes
+    // for other linstor-objects like resources, snapshots, etc...
+    map<string, string> node_props_to_set = 4;
+    repeated string node_prop_keys_to_delete = 5;
+    repeated string node_prop_namespaces_to_delete = 6;
+
+    // The fullSyncId of the FullSync this message answers
+    int64 full_sync_id = 7;
+
+    // next id: 8
+}
+
+enum FullSyncResult
+{
+    SUCCESS = 0;
+    FAIL_MISSING_REQUIRED_EXT_TOOLS = 1;
+    // The satellite refused the FullSync since it expects a FullSync based on a newer fullSyncId
+    // (i.e. from a more recent authentication)
+    FAIL_OUTDATED_FULL_SYNC_ID = 2;
+    FAIL_UNKNOWN = 99;
+}

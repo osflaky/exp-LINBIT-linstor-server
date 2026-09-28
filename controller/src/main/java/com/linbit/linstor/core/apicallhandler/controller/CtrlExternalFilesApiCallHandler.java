@@ -1,0 +1,479 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.ImplementationError;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.LinStorDataAlreadyExistsException;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.pojo.ExtFileStatusPojo;
+import com.linbit.linstor.api.pojo.ExternalFilePojo;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.response.ApiDatabaseException;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.identifier.ExternalFileName;
+import com.linbit.linstor.core.objects.ExternalFile;
+import com.linbit.linstor.core.objects.ExternalFile.Flags;
+import com.linbit.linstor.core.objects.ExternalFileControllerFactory;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.repository.ExternalFileRepository;
+import com.linbit.linstor.core.repository.ResourceDefinitionRepository;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.netcom.PeerNotConnectedException;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.proto.javainternal.c2s.MsgIntReqExtFileStatusOuterClass.MsgIntReqExtFileStatus;
+import com.linbit.linstor.proto.javainternal.s2c.MsgIntExtFileStatusOuterClass.MsgIntExtFileStatus;
+import com.linbit.locks.LockGuard;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.function.Predicate;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Singleton
+public class CtrlExternalFilesApiCallHandler
+{
+    private final ErrorReporter errorReporter;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final LockGuardFactory lockGuardFactory;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final ResponseConverter responseConverter;
+    private final ScopeRunner scopeRunner;
+
+    private final ExternalFileControllerFactory extFileFactory;
+    private final ExternalFileRepository extFileRepository;
+    private final ResourceDefinitionRepository rscDfnRepo;
+
+    @Inject
+    public CtrlExternalFilesApiCallHandler(
+        ErrorReporter errorReporterRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        LockGuardFactory lockGuardFactoryRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        ScopeRunner scopeRunnerRef,
+        ResponseConverter responseConverterRef,
+        ExternalFileControllerFactory extFileFactoryRef,
+        ExternalFileRepository extFileRepositoryRef,
+        ResourceDefinitionRepository rscDfnRepoRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        scopeRunner = scopeRunnerRef;
+        responseConverter = responseConverterRef;
+        extFileFactory = extFileFactoryRef;
+        extFileRepository = extFileRepositoryRef;
+        rscDfnRepo = rscDfnRepoRef;
+    }
+
+    public List<ExternalFilePojo> listFiles(Predicate<String> includeExtFileRef)
+    {
+        ArrayList<ExternalFilePojo> ret = new ArrayList<>();
+        for (Entry<ExternalFileName, ExternalFile> entry : extFileRepository.getMapForView().entrySet())
+        {
+            if (includeExtFileRef.test(entry.getKey().extFileName))
+            {
+                ret.add(entry.getValue().getApiData(null, null));
+            }
+        }
+        return ret;
+    }
+
+    public Mono<ExtFileStatusPojo> getStatus(String extFileNameStr, String nodeNameStr)
+    {
+        return scopeRunner.fluxInTransactionlessScope(
+            "Query external file status",
+            lockGuardFactory.buildDeferred(LockType.READ, LockObj.EXT_FILE_MAP, LockObj.NODES_MAP),
+            () -> getStatusInTransaction(extFileNameStr, nodeNameStr)
+        ).next();
+    }
+
+    private Flux<ExtFileStatusPojo> getStatusInTransaction(String extFileNameStr, String nodeNameStr)
+    {
+        Node node = ctrlApiDataLoader.loadNode(nodeNameStr);
+        Peer peer = node.getPeer();
+
+        byte[] reqMsg;
+        try
+        {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            MsgIntReqExtFileStatus.newBuilder()
+                .setExternalFileName(extFileNameStr)
+                .build()
+                .writeDelimitedTo(baos);
+            reqMsg = baos.toByteArray();
+        }
+        catch (IOException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+
+        return peer.apiCall(InternalApiConsts.API_REQUEST_EXT_FILE_STATUS, reqMsg)
+            .onErrorResume(PeerNotConnectedException.class, ignored -> Flux.empty())
+            .map(this::parseExtFileStatus);
+    }
+
+    private ExtFileStatusPojo parseExtFileStatus(ByteArrayInputStream responseData)
+    {
+        try
+        {
+            MsgIntExtFileStatus respMsg = MsgIntExtFileStatus.parseDelimitedFrom(responseData);
+            return new ExtFileStatusPojo(respMsg.getActualPath(), respMsg.getContentMatch());
+        }
+        catch (IOException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    /**
+     * Checks if the given file-path is whitelisted in the stltConfig of the given node
+     *
+     *
+     * @return {@code true} if the file can be written<br/>
+     * {@code false} if it can't be written, the node doesn't exist, the nodeName or fileName is invalid, or there is an
+     * exception
+     */
+    public boolean checkFile(String fileName, String nodeName)
+    {
+        boolean allowed = false;
+        try (LockGuard lg = lockGuardFactory.build(LockType.READ, LockObj.EXT_FILE_MAP, LockObj.NODES_MAP))
+        {
+            @Nullable Node node = ctrlApiDataLoader.loadNodeOrNull(nodeName);
+            ExternalFileName extFileName = LinstorParsingUtils.asExtFileName(fileName);
+
+            if (node != null)
+            {
+                allowed = CtrlExternalFilesHelper.isPathWhitelisted(extFileName, node);
+            }
+        }
+        catch (ApiRcException exc)
+        {
+            // ignore exc, return false
+        }
+        return allowed;
+    }
+
+    public Flux<ApiCallRc> set(String extFileNameStr, @Nullable byte[] content, @Nullable List<String> altSuffixesRef)
+    {
+        ResponseContext context = makeExtFilesContext(
+            ApiOperation.makeModifyOperation(),
+            extFileNameStr
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Set external file",
+            lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.EXT_FILE_MAP),
+            () -> setInTransaction(extFileNameStr, content, altSuffixesRef)
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> setInTransaction(
+        String extFileNameStr,
+        @Nullable byte[] contentRef,
+        @Nullable List<String> altSuffixesRef
+    )
+    {
+        ExternalFileName extFileName = LinstorParsingUtils.asExtFileName(extFileNameStr);
+        @Nullable ExternalFile extFile = ctrlApiDataLoader.loadExtFileOrNull(extFileName);
+        try
+        {
+            if (extFile == null)
+            {
+                try
+                {
+                    checkValidContent(contentRef);
+                    checkValidPath(extFileNameStr);
+                    checkValidAltSuffixes(altSuffixesRef);
+
+                    extFile = extFileFactory.create(
+                        extFileName,
+                        contentRef,
+                        // not sure where the parameter comes from, so we make a copy of it, just to be sure
+                        altSuffixesRef == null ? new ArrayList<>() : new ArrayList<>(altSuffixesRef)
+                    );
+                    extFileRepository.put(extFile);
+                }
+                catch (LinStorDataAlreadyExistsException exc)
+                {
+                    throw new ImplementationError(exc);
+                }
+            }
+            else
+            {
+                if (contentRef != null && contentRef.length > 0)
+                {
+                    checkValidContent(contentRef);
+                    extFile.setContent(contentRef);
+                }
+                if (altSuffixesRef != null)
+                {
+                    checkValidAltSuffixes(altSuffixesRef);
+                    extFile.setAltSuffixes(altSuffixesRef);
+                }
+            }
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+
+        ctrlTransactionHelper.commit();
+        return ctrlSatelliteUpdateCaller.updateSatellite(extFile);
+    }
+
+    private void checkValidContent(@Nullable byte[] contentRef)
+    {
+        if (contentRef == null || contentRef.length == 0)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_EXT_FILE,
+                    "The content must not be null or empty"
+                )
+            );
+        }
+    }
+
+    private void checkValidAltSuffixes(@Nullable List<String> altSuffixesRef)
+    {
+        if (altSuffixesRef != null)
+        {
+            for (String suffix : altSuffixesRef)
+            {
+                if (suffix.contains("/") || suffix.contains(".."))
+                {
+                    throw new ApiRcException(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.FAIL_INVLD_EXT_FILE,
+                            "Alternative suffixes must not contain path separators or '..': " + suffix,
+                            true
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    private void checkValidPath(@Nullable String extFileNameStr)
+    {
+        if (extFileNameStr == null || extFileNameStr.isEmpty())
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_EXT_FILE,
+                    "The path must not be null or empty",
+                    true
+                )
+            );
+        }
+        if (!extFileNameStr.startsWith("/"))
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_EXT_FILE,
+                    "The path must be absolute",
+                    true
+                )
+            );
+        }
+    }
+
+    public Flux<ApiCallRc> delete(String extFileNameStrRef)
+    {
+        ResponseContext context = makeExtFilesContext(
+            ApiOperation.makeModifyOperation(),
+            extFileNameStrRef
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Delete external file",
+            lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.EXT_FILE_MAP),
+            () -> deleteInTransaction(extFileNameStrRef)
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> deleteInTransaction(String extFileNameStrRef)
+    {
+        Flux<ApiCallRc> flux;
+        ExternalFileName extFileName = LinstorParsingUtils.asExtFileName(extFileNameStrRef);
+        @Nullable ExternalFile extFile = ctrlApiDataLoader.loadExtFileOrNull(extFileName);
+        String extFileDescription = getExtFileDescription(extFileNameStrRef);
+
+        if (extFile == null)
+        {
+            flux = Flux.<ApiCallRc>just(
+                ApiCallRcImpl.singleApiCallRc(
+                    ApiConsts.WARN_NOT_FOUND,
+                    extFileDescription + " not found in LINSTOR database."
+                )
+            );
+        }
+        else
+        {
+            List<Flux<ApiCallRc>> cleanupFluxes = cleanupPropertyEntries(extFile);
+
+            enableFlags(extFile, ExternalFile.Flags.DELETE);
+            ctrlTransactionHelper.commit();
+            ApiCallRcImpl responses = new ApiCallRcImpl();
+            responses.addEntry(
+                ApiCallRcImpl
+                    .entryBuilder(ApiConsts.DELETED, extFileDescription + " marked for deletion.")
+                    .setDetails(extFileDescription + " UUID is: " + extFile.getUuid().toString())
+                    .build()
+            );
+            flux = Flux.<ApiCallRc>just(responses)
+                .concatWith(Flux.concat(cleanupFluxes))
+                .concatWith(ctrlSatelliteUpdateCaller.updateSatellite(extFile))
+                .concatWith(deleteImpl(extFile));
+        }
+        return flux;
+    }
+
+    /*
+     * For now, we only support rscDfn props. If that changes, this method needs to be extended as well!
+     */
+    private List<Flux<ApiCallRc>> cleanupPropertyEntries(ExternalFile extFileRef)
+    {
+        List<Flux<ApiCallRc>> fluxList = new ArrayList<>();
+        try
+        {
+            for (ResourceDefinition rscDfn : rscDfnRepo.getMapForView().values())
+            {
+                Props rscDfnProps = rscDfn.getProps();
+                boolean changed = CtrlExternalFilesHelper.removePath(rscDfnProps, extFileRef) != null;
+                if (changed)
+                {
+                    fluxList.add(
+                        ctrlSatelliteUpdateCaller.updateSatellites(rscDfn, null).transform(
+                            updateResponses -> CtrlResponseUtils.combineResponses(
+                                errorReporter,
+                                updateResponses,
+                                rscDfn.getName(),
+                                "Updated Resource definition {1} on {0}"
+                            )
+                        )
+                    );
+                }
+            }
+        }
+        catch (InvalidKeyException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+        return fluxList;
+    }
+
+    private Flux<ApiCallRc> deleteImpl(ExternalFile extFileRef)
+    {
+        ResponseContext context = makeExtFilesContext(
+            ApiOperation.makeModifyOperation(),
+            extFileRef.getName().extFileName
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Delete external file impl",
+            lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.EXT_FILE_MAP),
+            () -> deleteImplInTransaction(extFileRef)
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> deleteImplInTransaction(ExternalFile extFileRef)
+    {
+        ExternalFileName extFileName = extFileRef.getName();
+        String extFileDescription = getExtFileDescription(extFileName.extFileName);
+        UUID uuid = extFileRef.getUuid();
+
+        try
+        {
+            extFileRef.delete();
+            extFileRepository.remove(extFileName);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+
+        ctrlTransactionHelper.commit();
+
+        ApiCallRcImpl.ApiCallRcEntry response = ApiCallRcImpl
+            .entryBuilder(ApiConsts.DELETED, extFileDescription + " deleted.")
+            .setDetails(extFileDescription + " UUID was: " + uuid.toString())
+            .build();
+        return Flux.just(new ApiCallRcImpl(response));
+    }
+
+    private void enableFlags(ExternalFile extFileRef, Flags... flags)
+    {
+        try
+        {
+            extFileRef.getFlags().enableFlags(flags);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    public static ResponseContext makeExtFilesContext(
+        ApiOperation operation,
+        String pathRef
+    )
+    {
+        Map<String, String> objRefs = new TreeMap<>();
+        objRefs.put(ApiConsts.KEY_EXT_FILE, pathRef);
+
+        return new ResponseContext(
+            operation,
+            getExtFileDescription(pathRef),
+            getExtFileDescriptionInline(pathRef),
+            ApiConsts.MASK_EXT_FILES,
+            objRefs
+        );
+    }
+
+    public static String getExtFileDescription(String pathRef)
+    {
+        return "External file: " + pathRef;
+    }
+
+    public static String getExtFileDescriptionInline(String pathRef)
+    {
+        return "external file '" + pathRef + "'";
+    }
+}

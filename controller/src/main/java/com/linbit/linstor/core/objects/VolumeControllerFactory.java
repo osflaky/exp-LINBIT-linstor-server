@@ -1,0 +1,134 @@
+package com.linbit.linstor.core.objects;
+
+import com.linbit.drbd.md.MaxSizeException;
+import com.linbit.drbd.md.MinSizeException;
+import com.linbit.exceptions.InvalidSizeException;
+import com.linbit.linstor.LinStorDataAlreadyExistsException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.objects.utils.MixedStorPoolHelper;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.dbdrivers.interfaces.VolumeDatabaseDriver;
+import com.linbit.linstor.layer.LayerPayload;
+import com.linbit.linstor.layer.LayerSizeHelper;
+import com.linbit.linstor.layer.resource.CtrlRscLayerDataFactory;
+import com.linbit.linstor.propscon.PropsContainerFactory;
+import com.linbit.linstor.stateflags.StateFlagsBits;
+import com.linbit.linstor.storage.StorageException;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.transaction.TransactionObjectFactory;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.UUID;
+
+public class VolumeControllerFactory
+{
+    private final VolumeDatabaseDriver driver;
+    private final PropsContainerFactory propsContainerFactory;
+    private final TransactionObjectFactory transObjFactory;
+    private final Provider<TransactionMgr> transMgrProvider;
+    private final CtrlRscLayerDataFactory layerStackHelper;
+    private final MixedStorPoolHelper mixedStorPoolHelper;
+    private final LayerSizeHelper layerSizeHelper;
+
+    @Inject
+    public VolumeControllerFactory(
+        VolumeDatabaseDriver driverRef,
+        PropsContainerFactory propsContainerFactoryRef,
+        TransactionObjectFactory transObjFactoryRef,
+        Provider<TransactionMgr> transMgrProviderRef,
+        CtrlRscLayerDataFactory layerStackHelperRef,
+        MixedStorPoolHelper mixedStorPoolHelperRef,
+        LayerSizeHelper layerSizeHelperRef
+    )
+    {
+        driver = driverRef;
+        propsContainerFactory = propsContainerFactoryRef;
+        transObjFactory = transObjFactoryRef;
+        transMgrProvider = transMgrProviderRef;
+        layerStackHelper = layerStackHelperRef;
+        mixedStorPoolHelper = mixedStorPoolHelperRef;
+        layerSizeHelper = layerSizeHelperRef;
+    }
+
+    public <RSC extends AbsResource<RSC>> Volume create(
+        Resource rsc,
+        VolumeDefinition vlmDfn,
+        @Nullable Volume.Flags[] flags,
+        LayerPayload payload,
+        @Nullable AbsRscLayerObject<RSC> absLayerData,
+        Map<String, String> storpoolRenameMap,
+        @Nullable ApiCallRc apiCallRc
+    )
+        throws DatabaseException, LinStorDataAlreadyExistsException, MinSizeException,
+        MaxSizeException, StorageException
+    {
+
+        Volume volData = rsc.getVolume(vlmDfn.getVolumeNumber());
+
+        if (volData != null)
+        {
+            throw new LinStorDataAlreadyExistsException("The Volume already exists");
+        }
+
+        volData = new Volume(
+            UUID.randomUUID(),
+            rsc,
+            vlmDfn,
+            StateFlagsBits.getMask(flags),
+            driver,
+            new TreeMap<>(),
+            propsContainerFactory,
+            transObjFactory,
+            transMgrProvider
+        );
+
+        driver.create(volData);
+        rsc.putVolume(volData);
+        vlmDfn.putVolume(volData);
+
+        if (absLayerData == null)
+        {
+            layerStackHelper.ensureStackDataExists(rsc, null, payload);
+        }
+        else
+        {
+            // ignore payload if we have snapLayerData
+            layerStackHelper.copyLayerData(absLayerData, rsc, storpoolRenameMap, apiCallRc);
+        }
+
+        try
+        {
+            // calculate the sizes also include some maximum size checks (like 1 PiB for DRBD)
+            layerSizeHelper.calculateSize(
+                rsc.getLayerData().getVlmProviderObject(vlmDfn.getVolumeNumber())
+            );
+        }
+        catch (InvalidSizeException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.entryBuilder(
+                    ApiConsts.FAIL_INVLD_VLM_SIZE,
+                    "The size " + vlmDfn.getVolumeSize() + " is invalid. See cause for more details"
+                )
+                    .setSkipErrorReport(true)
+                    .build(),
+                exc
+            );
+        }
+
+        mixedStorPoolHelper.handleMixedStoragePools(volData);
+
+        vlmDfn.recheckVolumeSize();
+
+        return volData;
+    }
+}

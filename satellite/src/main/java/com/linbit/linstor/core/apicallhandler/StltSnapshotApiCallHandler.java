@@ -1,0 +1,441 @@
+package com.linbit.linstor.core.apicallhandler;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.pojo.SnapshotPojo;
+import com.linbit.linstor.backupshipping.BackupShippingMgr;
+import com.linbit.linstor.core.ControllerPeerConnector;
+import com.linbit.linstor.core.CoreModule;
+import com.linbit.linstor.core.CriticalError;
+import com.linbit.linstor.core.DeviceManager;
+import com.linbit.linstor.core.apis.ResourceDefinitionApi;
+import com.linbit.linstor.core.apis.SnapshotDefinitionApi;
+import com.linbit.linstor.core.apis.SnapshotVolumeApi;
+import com.linbit.linstor.core.apis.SnapshotVolumeDefinitionApi;
+import com.linbit.linstor.core.identifier.ResourceGroupName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.SnapshotName;
+import com.linbit.linstor.core.identifier.VolumeNumber;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.ResourceDefinitionSatelliteFactory;
+import com.linbit.linstor.core.objects.ResourceGroup;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.SnapshotDefinition;
+import com.linbit.linstor.core.objects.SnapshotDefinitionSatelliteFactory;
+import com.linbit.linstor.core.objects.SnapshotSatelliteFactory;
+import com.linbit.linstor.core.objects.SnapshotVolume;
+import com.linbit.linstor.core.objects.SnapshotVolumeDefinition;
+import com.linbit.linstor.core.objects.SnapshotVolumeDefinitionSatelliteFactory;
+import com.linbit.linstor.core.objects.SnapshotVolumeSatelliteFactory;
+import com.linbit.linstor.core.objects.merger.StltLayerSnapDataMerger;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.stateflags.FlagsHelper;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+import com.linbit.linstor.utils.PropsUtils;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Singleton
+public class StltSnapshotApiCallHandler
+{
+    private final ErrorReporter errorReporter;
+    private final DeviceManager deviceManager;
+    private final CoreModule.ResourceGroupMap rscGrpMap;
+    private final CoreModule.ResourceDefinitionMap rscDfnMap;
+    private final ControllerPeerConnector controllerPeerConnector;
+    private final ResourceDefinitionSatelliteFactory resourceDefinitionFactory;
+    private final SnapshotDefinitionSatelliteFactory snapDfnFactory;
+    private final SnapshotVolumeDefinitionSatelliteFactory snapVlmDfnFactory;
+    private final SnapshotSatelliteFactory snapshotFactory;
+    private final SnapshotVolumeSatelliteFactory snapVlmFactory;
+    private final StltRscGrpApiCallHelper rscGrpApiCallHelper;
+    private final StltLayerSnapDataMerger layerSnapDataMerger;
+    private final Provider<TransactionMgr> transMgrProvider;
+    private final BackupShippingMgr backupShippingMgr;
+
+    @Inject
+    StltSnapshotApiCallHandler(
+        ErrorReporter errorReporterRef,
+        DeviceManager deviceManagerRef,
+        CoreModule.ResourceGroupMap rscGrpMapRef,
+        CoreModule.ResourceDefinitionMap rscDfnMapRef,
+        ControllerPeerConnector controllerPeerConnectorRef,
+        ResourceDefinitionSatelliteFactory resourceDefinitionFactoryRef,
+        SnapshotDefinitionSatelliteFactory snapshotDefinitionFactoryRef,
+        SnapshotVolumeDefinitionSatelliteFactory snapshotVolumeDefinitionFactoryRef,
+        SnapshotSatelliteFactory snapshotFactoryRef,
+        SnapshotVolumeSatelliteFactory snapshotVolumeFactoryRef,
+        StltRscGrpApiCallHelper stltGrpApiCallHelperRef,
+        StltLayerSnapDataMerger layerSnapDataMergerRef,
+        Provider<TransactionMgr> transMgrProviderRef,
+        BackupShippingMgr backupShippingMgrRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        deviceManager = deviceManagerRef;
+        rscGrpMap = rscGrpMapRef;
+        rscDfnMap = rscDfnMapRef;
+        controllerPeerConnector = controllerPeerConnectorRef;
+        resourceDefinitionFactory = resourceDefinitionFactoryRef;
+        snapDfnFactory = snapshotDefinitionFactoryRef;
+        snapVlmDfnFactory = snapshotVolumeDefinitionFactoryRef;
+        snapshotFactory = snapshotFactoryRef;
+        snapVlmFactory = snapshotVolumeFactoryRef;
+        rscGrpApiCallHelper = stltGrpApiCallHelperRef;
+        layerSnapDataMerger = layerSnapDataMergerRef;
+        transMgrProvider = transMgrProviderRef;
+        backupShippingMgr = backupShippingMgrRef;
+    }
+
+    public void applyChanges(SnapshotPojo snapshotRaw)
+    {
+        try
+        {
+            ResourceDefinition rscDfn = mergeResourceDefinition(snapshotRaw.getSnaphotDfn().getRscDfn());
+
+            SnapshotDefinition snapshotDfn = mergeSnapshotDefinition(snapshotRaw.getSnaphotDfn(), rscDfn);
+
+            mergeSnapshot(snapshotRaw, snapshotDfn);
+
+            rscDfnMap.put(rscDfn.getName(), rscDfn);
+
+            transMgrProvider.get().commit();
+
+            errorReporter.logInfo(
+                "Snapshot '%s' of resource '%s' registered.",
+                snapshotDfn.getName().displayValue,
+                rscDfn.getName().displayValue
+            );
+            deviceManager.snapshotUpdateApplied(Collections.singleton(
+                snapshotDfn.getSnapDfnKey()
+            ));
+        }
+        catch (Exception | ImplementationError exc)
+        {
+            errorReporter.reportError(exc);
+        }
+    }
+
+    private ResourceDefinition mergeResourceDefinition(ResourceDefinitionApi rscDfnApi)
+        throws InvalidNameException, DatabaseException
+    {
+        ResourceName rscName = new ResourceName(rscDfnApi.getResourceName());
+
+        ResourceDefinition.Flags[] rscDfnFlags = ResourceDefinition.Flags.restoreFlags(rscDfnApi.getFlags());
+
+        ResourceGroup rscGrp = rscGrpApiCallHelper.mergeResourceGroup(rscDfnApi.getResourceGroup());
+
+        ResourceDefinition rscDfn = rscDfnMap.get(rscName);
+        if (rscDfn == null)
+        {
+            rscDfn = resourceDefinitionFactory.getInstanceSatellite(
+                rscDfnApi.getUuid(),
+                rscGrp,
+                rscName,
+                rscDfnFlags
+            );
+
+            checkUuid(rscDfn, rscDfnApi);
+
+            rscDfnMap.put(rscName, rscDfn);
+        }
+        Props rscDfnProps = rscDfn.getProps();
+        rscDfnProps.map().putAll(rscDfnApi.getProps());
+        rscDfnProps.keySet().retainAll(rscDfnApi.getProps().keySet());
+        rscDfn.getFlags().resetFlagsTo(rscDfnFlags);
+        return rscDfn;
+    }
+
+    private SnapshotDefinition mergeSnapshotDefinition(
+        SnapshotDefinitionApi snapshotDfnApi,
+        ResourceDefinition rscDfn
+    )
+        throws InvalidNameException, ValueOutOfRangeException,
+            DatabaseException
+    {
+        SnapshotName snapName = new SnapshotName(snapshotDfnApi.getSnapshotName());
+
+        SnapshotDefinition snapDfn = rscDfn.getSnapshotDfn(snapName);
+        if (snapDfn == null)
+        {
+            snapDfn = snapDfnFactory.getInstanceSatellite(
+                snapshotDfnApi.getUuid(),
+                rscDfn,
+                snapName,
+                new SnapshotDefinition.Flags[]{}
+            );
+
+            rscDfn.addSnapshotDfn(snapDfn);
+        }
+        checkUuid(snapDfn, snapshotDfnApi);
+
+        PropsUtils.resetProps(snapshotDfnApi.getSnapDfnProps(), snapDfn.getSnapDfnProps());
+        PropsUtils.resetProps(snapshotDfnApi.getRscDfnProps(), snapDfn.getRscDfnPropsForChange());
+
+        snapDfn.getFlags().resetFlagsTo(SnapshotDefinition.Flags.restoreFlags(snapshotDfnApi.getFlags()));
+        errorReporter.logTrace(
+            "resetting flags of local snapdfn (%s) to %s",
+            snapDfn,
+            FlagsHelper.toStringList(SnapshotDefinition.Flags.class, snapshotDfnApi.getFlags())
+        );
+
+        // Merge satellite volume definitions
+        Set<VolumeNumber> oldVlmNrs = snapDfn.getAllSnapshotVolumeDefinitions()
+            .stream()
+            .map(SnapshotVolumeDefinition::getVolumeNumber)
+            .collect(Collectors.toCollection(HashSet::new));
+
+        for (SnapshotVolumeDefinitionApi snapVlmDfnApi : snapshotDfnApi.getSnapshotVlmDfnList())
+        {
+            VolumeNumber vlmNr = new VolumeNumber(snapVlmDfnApi.getVolumeNr());
+            oldVlmNrs.remove(vlmNr);
+
+            SnapshotVolumeDefinition.Flags[] snapVlmDfnFlags = SnapshotVolumeDefinition.Flags.restoreFlags(
+                snapVlmDfnApi.getFlags()
+            );
+
+            SnapshotVolumeDefinition snapVlmDfn = snapDfn.getSnapshotVolumeDefinition(vlmNr);
+            if (snapVlmDfn == null)
+            {
+                snapVlmDfn = snapVlmDfnFactory.getInstanceSatellite(
+                    snapVlmDfnApi.getUuid(),
+                    snapDfn,
+                    rscDfn.getVolumeDfn(vlmNr),
+                    vlmNr,
+                    snapVlmDfnApi.getSize(),
+                    snapVlmDfnFlags
+                );
+            }
+
+            PropsUtils.resetProps(snapVlmDfnApi.getSnapVlmDfnPropsMap(), snapVlmDfn.getSnapVlmDfnProps());
+            PropsUtils.resetProps(snapVlmDfnApi.getVlmDfnPropsMap(), snapVlmDfn.getVlmDfnPropsForChange());
+
+            snapVlmDfn.getFlags().resetFlagsTo(snapVlmDfnFlags);
+        }
+
+        for (VolumeNumber oldVolumeNumber : oldVlmNrs)
+        {
+            snapDfn.removeSnapshotVolumeDefinition(oldVolumeNumber);
+        }
+
+        return snapDfn;
+    }
+
+    private void mergeSnapshot(SnapshotPojo snapshotRaw, SnapshotDefinition snapshotDfn)
+        throws ValueOutOfRangeException, InvalidNameException,
+            DatabaseException
+    {
+        Node localNode = controllerPeerConnector.getLocalNode();
+        Snapshot snap = snapshotDfn.getSnapshot(localNode.getName());
+        Snapshot.Flags[] snapshotFlags = Snapshot.Flags.restoreFlags(snapshotRaw.getFlags());
+        if (snap == null)
+        {
+            snap = snapshotFactory.getInstanceSatellite(
+                snapshotRaw.getSnapshotUuid(),
+                localNode,
+                snapshotDfn,
+                snapshotFlags
+            );
+        }
+        checkUuid(snap, snapshotRaw);
+        snap.getFlags().resetFlagsTo(snapshotFlags);
+        errorReporter.logTrace(
+            "resetting flags of local snapshot (%s) to %s, suspendIO: %b, takeSnapshot: %b, shipBackup: %b",
+            snap,
+            FlagsHelper.toStringList(Snapshot.Flags.class, snapshotRaw.getFlags()),
+            snapshotRaw.getSuspendResource(),
+            snapshotRaw.getTakeSnapshot(),
+            snapshotRaw.getShipBackup()
+        );
+        snap.setSuspendResource(snapshotRaw.getSuspendResource());
+        snap.setTakeSnapshot(snapshotRaw.getTakeSnapshot());
+        snap.setShipBackup(snapshotRaw.getShipBackup());
+
+        PropsUtils.resetProps(snapshotRaw.getSnapPropsMap(), snap.getSnapProps());
+        PropsUtils.resetProps(snapshotRaw.getRscPropsMap(), snap.getRscPropsForChange());
+
+        for (SnapshotVolumeApi snapshotVlmApi : snapshotRaw.getSnapshotVlmList())
+        {
+            mergeSnapVlm(snapshotVlmApi, snap);
+        }
+
+        layerSnapDataMerger.mergeLayerData(snap, snapshotRaw.getLayerData(), false);
+    }
+
+    private void mergeSnapVlm(SnapshotVolumeApi snapVlmApi, Snapshot snap)
+        throws ValueOutOfRangeException
+    {
+        VolumeNumber vlmNr = new VolumeNumber(snapVlmApi.getSnapshotVlmNr());
+        SnapshotVolume snapVlm = snap.getVolume(vlmNr);
+        if (snapVlm == null)
+        {
+            snapVlm = snapVlmFactory.getInstanceSatellite(
+                snapVlmApi.getSnapshotVlmUuid(),
+                snap,
+                snap.getSnapshotDefinition().getSnapshotVolumeDefinition(vlmNr)
+            );
+
+            snap.putVolume(snapVlm);
+        }
+
+        PropsUtils.resetProps(snapVlmApi.getSnapVlmPropsMap(), snapVlm.getSnapVlmProps());
+        PropsUtils.resetProps(snapVlmApi.getVlmPropsMap(), snapVlm.getVlmPropsForChange());
+
+        checkUuid(snapVlm, snapVlmApi);
+    }
+
+    public void applyEndedSnapshot(String rscNameStr, String snapshotNameStr)
+    {
+        try
+        {
+            ResourceName rscName = new ResourceName(rscNameStr);
+            SnapshotName snapshotName = new SnapshotName(snapshotNameStr);
+
+            ResourceDefinition rscDfn = rscDfnMap.get(rscName);
+            if (rscDfn != null)
+            {
+                SnapshotDefinition snapDfn = rscDfn.getSnapshotDfn(snapshotName);
+                if (snapDfn != null)
+                {
+                    deleteSnapshotsAndCleanup(
+                        rscDfnMap,
+                        rscGrpMap,
+                        snapDfn,
+                        errorReporter,
+                        backupShippingMgr
+                    );
+                }
+                transMgrProvider.get().commit();
+            }
+
+            deviceManager.snapshotUpdateApplied(
+                Collections.singleton(new SnapshotDefinition.Key(rscName, snapshotName))
+            );
+        }
+        catch (Exception | ImplementationError exc)
+        {
+            errorReporter.reportError(exc);
+        }
+    }
+
+    public static void deleteSnapshotsAndCleanup(
+        CoreModule.ResourceDefinitionMap rscDfnMapRef,
+        CoreModule.ResourceGroupMap rscGrpMapRef,
+        SnapshotDefinition snapDfn,
+        ErrorReporter errorReporterRef,
+        BackupShippingMgr backupShippingMgrRef
+    )
+        throws DatabaseException
+    {
+        ResourceDefinition rscDfn = snapDfn.getResourceDefinition();
+        SnapshotName snapName = snapDfn.getName();
+        ArrayList<Snapshot> copyOfSnapshots = new ArrayList<>(snapDfn.getAllSnapshots());
+        for (Snapshot snap : copyOfSnapshots)
+        {
+            backupShippingMgrRef.snapshotDeleted(snap);
+            snap.delete();
+        }
+        snapDfn.delete();
+
+        errorReporterRef.logInfo("Snapshot '%s' deleted.", snapName);
+
+        if (rscDfn.getResourceCount() == 0 && rscDfn.getSnapshotDfns().isEmpty())
+        {
+            ResourceName rscName = rscDfn.getName();
+            @Nullable ResourceDefinition removedRscDfn = rscDfnMapRef.remove(rscName);
+            if (removedRscDfn != null)
+            {
+                ResourceGroup rscGrp = removedRscDfn.getResourceGroup();
+                removedRscDfn.delete();
+                errorReporterRef.logInfo(
+                    "Resource definition '%s' deleted (triggered by deletion of snapshot '%s')",
+                    rscName,
+                    snapName
+                );
+                if (!rscGrp.hasResourceDefinitions())
+                {
+                    ResourceGroupName rscGrpName = rscGrp.getName();
+                    errorReporterRef.logInfo(
+                        "Resource group '%s' deleted (triggered by deletion of resource definition '%s')",
+                        rscGrpName,
+                        rscName
+                    );
+                    rscGrpMapRef.remove(rscGrpName);
+                    rscGrp.delete();
+                }
+            }
+        }
+    }
+
+    private void checkUuid(ResourceDefinition rscDfn, ResourceDefinitionApi rscDfnApi)
+    {
+        checkUuid(
+            rscDfn.getUuid(),
+            rscDfnApi.getUuid(),
+            "ResourceDefinition",
+            rscDfn.getName().displayValue,
+            rscDfnApi.getResourceName()
+        );
+    }
+
+    private void checkUuid(SnapshotDefinition snapshotDfn, SnapshotDefinitionApi snapshotDfnApi)
+    {
+        checkUuid(
+            snapshotDfn.getUuid(),
+            snapshotDfnApi.getUuid(),
+            "SnapshotDefinition",
+            snapshotDfn.getName().displayValue,
+            snapshotDfnApi.getSnapshotName()
+        );
+    }
+
+    private void checkUuid(Snapshot snapshot, SnapshotPojo snapshotRaw)
+    {
+        checkUuid(
+            snapshot.getUuid(),
+            snapshotRaw.getSnapshotUuid(),
+            "Snapshot",
+            snapshot.getSnapshotName().displayValue,
+            snapshotRaw.getSnaphotDfn().getSnapshotName()
+        );
+    }
+
+    private void checkUuid(SnapshotVolume snapshotVolume, SnapshotVolumeApi snapshotVlmApi)
+    {
+        checkUuid(
+            snapshotVolume.getUuid(),
+            snapshotVlmApi.getSnapshotVlmUuid(),
+            "SnapshotVolume",
+            String.valueOf(snapshotVolume.getVolumeNumber()),
+            String.valueOf(snapshotVlmApi.getSnapshotVlmNr())
+        );
+    }
+
+    private void checkUuid(UUID localUuid, UUID remoteUuid, String type, String localName, String remoteName)
+    {
+        if (!localUuid.equals(remoteUuid))
+        {
+            CriticalError.dieUuidMissmatch(
+                type,
+                localName,
+                remoteName,
+                localUuid,
+                remoteUuid
+            );
+        }
+    }
+}

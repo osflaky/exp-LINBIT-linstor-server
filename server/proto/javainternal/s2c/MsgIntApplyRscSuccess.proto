@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package com.linbit.linstor.proto.javainternal.s2c;
+import "common/RscLayerData.proto";
+import "javainternal/IntObjectId.proto";
+
+// Internal message about a successful resource creation or modification
+message MsgIntApplyRscSuccess
+{
+    IntObjectId rsc_id = 1;
+    common.RscLayerData layer_object = 2;
+
+    // <key, value>
+    map<string, string> rsc_props = 3;
+    // <vlm_nr, <key, value>>
+    map<sint32, Props> vlm_props = 4;
+    // <snap_name, <key, value>>
+    map<string, Props> snap_props = 5;
+    // <snap_name, <vlm_nr, <key, value>>
+    map<string, SnapVlmProps> snap_vlm_props = 6;
+    // <snap_name, snap-layer-data>
+    map<string, common.RscLayerData> snap_storage_layer_objects = 7;
+    //next id 8
+}
+
+message Props
+{
+    map<string, string> prop = 1;
+}
+
+message SnapVlmProps
+{
+    map<sint32, Props> snap_vlm_props = 1;
+}

@@ -1,0 +1,2092 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.ImplementationError;
+import com.linbit.ServiceName;
+import com.linbit.SizeSpecParser;
+import com.linbit.SystemService;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.extproc.ChildProcessHandler;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.LinStorException;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRc.RcEntry;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiCallRcImpl.ApiCallRcEntry;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.serializer.CtrlStltSerializer;
+import com.linbit.linstor.api.prop.LinStorObject;
+import com.linbit.linstor.api.prop.WhitelistProps;
+import com.linbit.linstor.api.rest.v1.config.GrizzlyHttpService;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes.SatelliteConfig;
+import com.linbit.linstor.backupshipping.BackupConsts;
+import com.linbit.linstor.core.CoreModule;
+import com.linbit.linstor.core.CoreModule.NodesMap;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlPropsHelper.PropertyChangedListener;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperContext;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperResult;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperType;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscAutoHelper;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscAutoQuorumHelper;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscDfnAutoVerifyAlgoHelper;
+import com.linbit.linstor.core.apicallhandler.controller.autoplacer.Autoplacer;
+import com.linbit.linstor.core.apicallhandler.controller.exceptions.IncorrectPassphraseException;
+import com.linbit.linstor.core.apicallhandler.controller.exceptions.MissingKeyPropertyException;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.EncryptionHelper;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.PropsChangedListenerBuilder;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlBackupQueueInternalCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.controller.utils.ResourceDefinitionUtils;
+import com.linbit.linstor.core.apicallhandler.controller.utils.ZfsDeleteStrategy;
+import com.linbit.linstor.core.apicallhandler.controller.utils.ZfsRollbackStrategy;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.apicallhandler.response.ResponseUtils;
+import com.linbit.linstor.core.apis.ControllerConfigApi;
+import com.linbit.linstor.core.apis.SatelliteConfigApi;
+import com.linbit.linstor.core.cfg.CtrlConfig;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.repository.SystemConfRepository;
+import com.linbit.linstor.core.types.MinorNumber;
+import com.linbit.linstor.core.types.TcpPortNumber;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.numberpool.DynamicNumberPool;
+import com.linbit.linstor.numberpool.NumberPoolModule;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.propscon.InvalidValueException;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.propscon.ReadOnlyProps;
+import com.linbit.linstor.range.Range;
+import com.linbit.linstor.tasks.AutoDbExportTask;
+import com.linbit.linstor.tasks.AutoDiskfulTask;
+import com.linbit.linstor.tasks.AutoSnapshotTask;
+import com.linbit.linstor.tasks.BalanceResourcesTask;
+import com.linbit.linstor.tasks.ReconnectorTask;
+import com.linbit.linstor.tasks.TaskScheduleService;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+import com.linbit.utils.PairNonNull;
+import com.linbit.utils.StringUtils;
+import com.linbit.utils.TripleNonNull;
+import com.linbit.utils.UuidUtils;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.BiConsumer;
+
+import org.slf4j.MDC;
+import org.slf4j.event.Level;
+import reactor.core.publisher.Flux;
+
+import static com.linbit.locks.LockGuardFactory.LockType.WRITE;
+
+@Singleton
+public class CtrlConfApiCallHandler
+{
+    private static final int MAX_REMOTE_NAME_LEN = 10;
+
+    private final ErrorReporter errorReporter;
+    private final SystemConfRepository systemConfRepository;
+    private final DynamicNumberPool minorNrPool;
+    private final DynamicNumberPool backupShipPortPool;
+    private final Provider<Peer> peerProvider;
+    private final Provider<TransactionMgr> transMgrProvider;
+
+    private final CtrlStltSerializer ctrlStltSrzl;
+    private final NodesMap nodesMap;
+    private final CoreModule.ResourceDefinitionMap rscDfnMap;
+    private final WhitelistProps whitelistProps;
+    private final EncryptionHelper encHelper;
+    private final CtrlConfig ctrlCfg;
+    private final ScopeRunner scopeRunner;
+    private final ResponseConverter responseConverter;
+    private final CtrlNodeApiCallHandler ctrlNodeApiCallHandler;
+
+    private final LockGuardFactory lockGuardFactory;
+    private final AutoDiskfulTask autoDiskfulTask;
+    private final ReconnectorTask reconnectorTask;
+    private final AutoDbExportTask autoDbExportTask;
+    private final CtrlRscDfnAutoVerifyAlgoHelper ctrlRscDfnAutoVerifyAlgoHelper;
+
+    private final AutoSnapshotTask autoSnapshotTask;
+    private final CtrlSnapshotDeleteApiCallHandler ctrlSnapDeleteHandler;
+    private final CtrlResyncAfterHelper ctrlResyncAfterHelper;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+
+    private final Provider<PropsChangedListenerBuilder> propsChangeListenerBuilder;
+
+    private final CtrlBackupQueueInternalCallHandler ctrlBackupQueueHandler;
+    private final TaskScheduleService taskScheduleService;
+    private final BalanceResourcesTask balanceResourcesTask;
+
+    private final CtrlRscAutoHelper ctrlRscAutoHelper;
+    private final Map<ServiceName, SystemService> systemServicesMap;
+
+
+    public enum LinstorEncryptionStatus
+    {
+        UNSET,
+        LOCKED,
+        UNLOCKED,
+    }
+
+    @FunctionalInterface
+    private interface SpecialPropHandler
+    {
+        /**
+         * This method is expected to delete the entries of the input map/sets once those are handled and should NOT be
+         * passed through to the usual whitelisting mechanism
+         */
+        @Nullable
+        ApiCallRc handle(
+            HashMap<String, String> filteredOverrideProps,
+            HashSet<String> filteredDeletePropKeys,
+            HashSet<String> filteredDeleteNamespaces,
+            Map<String, PropertyChangedListener> propertyChangedListeners
+        );
+    }
+
+    @Inject
+    public CtrlConfApiCallHandler(
+        ErrorReporter errorReporterRef,
+        SystemConfRepository systemConfRepositoryRef,
+        @Named(NumberPoolModule.MINOR_NUMBER_POOL) DynamicNumberPool minorNrPoolRef,
+        @Named(
+            NumberPoolModule.BACKUP_SHIPPING_PORT_POOL
+        ) DynamicNumberPool backupShipPortPoolRef,
+        Provider<Peer> peerProviderRef,
+        Provider<TransactionMgr> transMgrProviderRef,
+        CoreModule.NodesMap nodesMapRef,
+        CtrlStltSerializer ctrlStltSrzlRef,
+        WhitelistProps whitelistPropsRef,
+        EncryptionHelper encHelperRef,
+        LockGuardFactory lockGuardFactoryRef,
+        ScopeRunner scopeRunnerRef,
+        CtrlConfig ctrlCfgRef,
+        ResponseConverter responseConverterRef,
+        CtrlNodeApiCallHandler ctrlNodeApiCallHandlerRef,
+        AutoDiskfulTask autoDiskfulTaskRef,
+        ReconnectorTask reconnectorTaskRef,
+        AutoDbExportTask autoDbExportTaskRef,
+        CoreModule.ResourceDefinitionMap rscDfnMapRef,
+        CtrlRscDfnAutoVerifyAlgoHelper ctrlRscDfnAutoVerifyAlgoHelperRef,
+        AutoSnapshotTask autoSnapshotTaskRef,
+        CtrlSnapshotDeleteApiCallHandler ctrlSnapDeleteHandlerRef,
+        CtrlResyncAfterHelper ctrlResyncAfterHelperRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        Provider<PropsChangedListenerBuilder> propsChangeListenerBuilderRef,
+        CtrlBackupQueueInternalCallHandler ctrlBackupQueueHandlerRef,
+        TaskScheduleService taskScheduleServiceRef,
+        BalanceResourcesTask balanceResourcesTaskRef,
+        CtrlRscAutoHelper ctrlRscAutoHelperRef,
+        Map<ServiceName, SystemService> systemServicesMapRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        systemConfRepository = systemConfRepositoryRef;
+        minorNrPool = minorNrPoolRef;
+        backupShipPortPool = backupShipPortPoolRef;
+        peerProvider = peerProviderRef;
+        transMgrProvider = transMgrProviderRef;
+
+        nodesMap = nodesMapRef;
+        autoDbExportTask = autoDbExportTaskRef;
+        rscDfnMap = rscDfnMapRef;
+        ctrlStltSrzl = ctrlStltSrzlRef;
+        whitelistProps = whitelistPropsRef;
+        encHelper = encHelperRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        scopeRunner = scopeRunnerRef;
+        ctrlCfg = ctrlCfgRef;
+        responseConverter = responseConverterRef;
+        ctrlNodeApiCallHandler = ctrlNodeApiCallHandlerRef;
+        autoDiskfulTask = autoDiskfulTaskRef;
+        reconnectorTask = reconnectorTaskRef;
+        ctrlRscDfnAutoVerifyAlgoHelper = ctrlRscDfnAutoVerifyAlgoHelperRef;
+        autoSnapshotTask = autoSnapshotTaskRef;
+        ctrlSnapDeleteHandler = ctrlSnapDeleteHandlerRef;
+        ctrlResyncAfterHelper = ctrlResyncAfterHelperRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        propsChangeListenerBuilder = propsChangeListenerBuilderRef;
+        ctrlBackupQueueHandler = ctrlBackupQueueHandlerRef;
+        taskScheduleService = taskScheduleServiceRef;
+        balanceResourcesTask = balanceResourcesTaskRef;
+        ctrlRscAutoHelper = ctrlRscAutoHelperRef;
+        systemServicesMap = systemServicesMapRef;
+    }
+
+    public void updateSatelliteConf()
+    {
+        for (Node nodeToContact : nodesMap.values())
+        {
+            Peer satellitePeer = nodeToContact.getPeer();
+
+            if (satellitePeer.isOnline() && !satellitePeer.hasFullSyncFailed())
+            {
+                byte[] changedMessage = ctrlStltSrzl
+                    .onewayBuilder(InternalApiConsts.API_CHANGED_CONTROLLER)
+                    .build();
+
+                satellitePeer.sendMessage(changedMessage);
+            }
+        }
+    }
+
+    public Flux<ApiCallRc> modifyCtrl(
+        Map<String, String> overridePropsRef,
+        Set<String> deletePropKeysRef,
+        Set<String> deletePropNamespacesRef
+    )
+    {
+        ResponseContext context = makeCtrlConfContext(
+            ApiOperation.makeModifyOperation()
+        );
+
+        String autoHttpsKey = ApiConsts.NAMESPC_REST + "/" + ApiConsts.KEY_AUTO_HTTPS;
+        boolean autoHttpsTouched = overridePropsRef.containsKey(autoHttpsKey) ||
+            deletePropKeysRef.contains(autoHttpsKey) ||
+            deletePropNamespacesRef.contains(ApiConsts.NAMESPC_REST);
+        boolean autoHttpsBefore = autoHttpsTouched && isAutoHttpsEnabled();
+
+        Flux<ApiCallRc> flux = scopeRunner
+            .fluxInTransactionalScope(
+                "modifyCtrl",
+                lockGuardFactory.buildDeferred(WRITE, LockObj.CTRL_CONFIG),
+                () -> modifyCtrlInTransaction(
+                    overridePropsRef,
+                    deletePropKeysRef,
+                    deletePropNamespacesRef
+                ),
+                MDC.getCopyOfContextMap()
+            )
+            .transform(responses -> responseConverter.reportingExceptions(context, responses));
+
+        if (autoHttpsTouched)
+        {
+            flux = flux.doFinally(ignored ->
+            {
+                boolean autoHttpsAfter = isAutoHttpsEnabled();
+                if (autoHttpsBefore != autoHttpsAfter)
+                {
+                    restartGrizzlyHttpService();
+                }
+            });
+        }
+
+        return flux;
+    }
+
+    private Flux<ApiCallRc> handleAutoQuorum(
+        Collection<ResourceDefinition> rscDfns,
+        Map<String, String> overrideProps, Set<String> deletePropKeys,
+        ApiCallRcImpl apiCallRc)
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+
+        String drbdQuorum = ApiConsts.NAMESPC_DRBD_RESOURCE_OPTIONS + "/" + InternalApiConsts.KEY_DRBD_QUORUM;
+        boolean drbdQuorumChanged = false;
+        if (overrideProps.containsKey(drbdQuorum))
+        {
+            overrideProps.put(ApiConsts.NAMESPC_INTERNAL_DRBD + "/" + ApiConsts.KEY_QUORUM_SET_BY, "user");
+            drbdQuorumChanged = true;
+        }
+
+        if (deletePropKeys.contains(drbdQuorum))
+        {
+            deletePropKeys.add(ApiConsts.NAMESPC_INTERNAL_DRBD + "/" + ApiConsts.KEY_QUORUM_SET_BY);
+            drbdQuorumChanged = true;
+        }
+
+        // run auto quorum/tiebreaker manage code
+        String autoTiebreakerKey = ApiConsts.NAMESPC_DRBD_OPTIONS + "/" +
+            ApiConsts.KEY_DRBD_AUTO_ADD_QUORUM_TIEBREAKER;
+        if (overrideProps.containsKey(autoTiebreakerKey) ||
+            deletePropKeys.contains(autoTiebreakerKey) ||
+            drbdQuorumChanged)
+        {
+            for (ResourceDefinition rscDfn : rscDfns)
+            {
+                ResponseContext context = CtrlRscDfnApiCallHandler.makeResourceDefinitionContext(
+                    ApiOperation.makeModifyOperation(),
+                    rscDfn.getName().displayValue
+                );
+
+                CtrlRscAutoQuorumHelper.removeQuorumPropIfSetByLinstor(rscDfn);
+                ApiCallRcImpl responses = new ApiCallRcImpl();
+                AutoHelperContext autoHelperCtx =
+                    new AutoHelperContext(responses, context, rscDfn);
+                AutoHelperResult autoResult = ctrlRscAutoHelper.manage(
+                    autoHelperCtx, new HashSet<>(Arrays.asList(
+                        AutoHelperType.AUTO_QUORUM,
+                        AutoHelperType.TIEBREAKER
+                    ))
+                );
+
+                apiCallRc.addEntries(autoResult.responses());
+                flux = flux.concatWith(autoResult.flux());
+            }
+        }
+
+        return flux;
+    }
+
+    private Flux<ApiCallRc> modifyCtrlInTransaction(
+        Map<String, String> overridePropsRef,
+        Set<String> deletePropKeysRef,
+        Set<String> deletePropNamespacesRef
+    )
+    {
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+
+        List<Flux<ApiCallRc>> specialPropFluxes = new ArrayList<>();
+        Map<String, PropertyChangedListener> propsChangedListeners = propsChangeListenerBuilder.get()
+            .buildPropsChangedListeners(specialPropFluxes);
+
+        /*
+         * Some properties need to be considered in combination with other properties.
+         * Those other properties might already exist, but might also be part of the current modification.
+         *
+         * Therefore we copy the input map/sets, filter them by special rules if necessary,
+         * and the properties that were not filtered are passed to the usual whitelisting mechanism as before
+         */
+        HashMap<String, String> filteredOverrideProps = new HashMap<>(overridePropsRef);
+        HashSet<String> filteredDeletePropKeys = new HashSet<>(deletePropKeysRef);
+        HashSet<String> filteredDeleteNamespaces = new HashSet<>(deletePropNamespacesRef);
+
+        // this list might get expanded so don't convert to Collections.singleton
+        List<SpecialPropHandler> specialHandlers = Arrays.asList(this::handleNetComModifications);
+        for (SpecialPropHandler specialHandler : specialHandlers)
+        {
+            ApiCallRc handlersApiCallRc = specialHandler.handle(
+                filteredOverrideProps,
+                filteredDeletePropKeys,
+                filteredDeleteNamespaces,
+                propsChangedListeners
+            );
+            if (handlersApiCallRc != null)
+            {
+                apiCallRc.addEntries(handlersApiCallRc);
+            }
+        }
+
+
+
+        boolean notifyStlts = false;
+        Flux<ApiCallRc> fluxUpdRscDfns = Flux.empty();
+        Set<Resource> updateRscs = new HashSet<>();
+        for (Entry<String, String> overrideProp : filteredOverrideProps.entrySet())
+        {
+            TripleNonNull<ApiCallRc, Boolean, Set<Resource>> result = setProp(
+                overrideProp.getKey(),
+                null,
+                overrideProp.getValue(),
+                propsChangedListeners
+            );
+            if (result.objA.hasErrors())
+            {
+                throw new ApiRcException(result.objA);
+            }
+            updateRscs.addAll(result.objC);
+            apiCallRc.addEntries(result.objA);
+            notifyStlts |= result.objB;
+        }
+        for (String deletePropKey : filteredDeletePropKeys)
+        {
+            TripleNonNull<ApiCallRc, Boolean, Set<Resource>> result = deleteProp(
+                deletePropKey,
+                null,
+                propsChangedListeners
+            );
+            if (result.objA.hasErrors())
+            {
+                throw new ApiRcException(result.objA);
+            }
+            updateRscs.addAll(result.objC);
+            apiCallRc.addEntries(result.objA);
+            notifyStlts |= result.objB;
+        }
+        for (String deleteNamespace : filteredDeleteNamespaces)
+        {
+            // we should not simply "drop" the namespace here, as we might have special cleanup logic
+            // for some of the deleted keys.
+            PairNonNull<ApiCallRc, Boolean> result = deleteNamespace(deleteNamespace, propsChangedListeners);
+            if (result.objA.hasErrors())
+            {
+                throw new ApiRcException(result.objA);
+            }
+            apiCallRc.addEntries(result.objA);
+            notifyStlts |= result.objB;
+        }
+
+        for (Resource rsc : updateRscs)
+        {
+            fluxUpdRscDfns = fluxUpdRscDfns.concatWith(
+                ctrlSatelliteUpdateCaller.updateSatellites(rsc, Flux.empty())
+                    .flatMap(updateTuple -> updateTuple == null ? Flux.empty() : updateTuple.getT2()));
+        }
+
+        fluxUpdRscDfns = fluxUpdRscDfns.concatWith(handleAutoQuorum(
+            rscDfnMap.values(), overridePropsRef, deletePropKeysRef, apiCallRc));
+
+        Flux<ApiCallRc> autoSnapFlux;
+        autoSnapFlux = ResourceDefinitionUtils.handleAutoSnapProps(
+            autoSnapshotTask,
+            ctrlSnapDeleteHandler,
+            filteredOverrideProps,
+            filteredDeletePropKeys,
+            filteredDeleteNamespaces,
+            Collections.unmodifiableCollection(rscDfnMap.values()),
+            systemConfRepository.getStltConfForView(),
+            false
+        );
+
+        transMgrProvider.get().commit();
+
+        Flux<ApiCallRc> updSatellites = Flux.empty();
+        if (notifyStlts)
+        {
+            updSatellites = ctrlSatelliteUpdateCaller.updateSatellitesConf();
+        }
+
+        String autoDiskfulKey = ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_AUTO_DISKFUL;
+        if (
+            overridePropsRef.containsKey(autoDiskfulKey) || deletePropKeysRef.contains(autoDiskfulKey) ||
+                deletePropNamespacesRef.contains(ApiConsts.NAMESPC_DRBD_OPTIONS)
+        )
+        {
+            autoDiskfulTask.update();
+        }
+
+        boolean hasKeyInDrbdOptions = false;
+        boolean maxConcurrentShippingsChanged = false;
+        for (String key : overridePropsRef.keySet())
+        {
+            if (key.startsWith(ApiConsts.NAMESPC_DRBD_OPTIONS))
+            {
+                hasKeyInDrbdOptions = true;
+            }
+            else if (key.equals(BackupConsts.CONCURRENT_BACKUPS_KEY))
+            {
+                maxConcurrentShippingsChanged = true;
+            }
+        }
+        for (String key : deletePropKeysRef)
+        {
+            if (key.startsWith(ApiConsts.NAMESPC_DRBD_OPTIONS))
+            {
+                hasKeyInDrbdOptions = true;
+            }
+            else if (key.equals(BackupConsts.CONCURRENT_BACKUPS_KEY))
+            {
+                maxConcurrentShippingsChanged = true;
+            }
+        }
+        hasKeyInDrbdOptions |= deletePropNamespacesRef.contains(ApiConsts.NAMESPC_DRBD_OPTIONS);
+        Flux<ApiCallRc> evictionFlux = Flux.empty();
+        if (hasKeyInDrbdOptions)
+        {
+            ArrayList<PairNonNull<Flux<ApiCallRc>, Peer>> rerunConfigChecks = reconnectorTask.rerunConfigChecks();
+            for (PairNonNull<Flux<ApiCallRc>, Peer> pair : rerunConfigChecks)
+            {
+                evictionFlux = evictionFlux.concatWith(pair.objA);
+            }
+        }
+        Flux<ApiCallRc> shippingFlux = Flux.empty();
+        if (maxConcurrentShippingsChanged)
+        {
+            shippingFlux = ctrlBackupQueueHandler.maxConcurrentShippingsChangedForCtrl();
+        }
+
+        return Flux.<ApiCallRc>just(apiCallRc)
+            .concatWith(updSatellites)
+            .concatWith(evictionFlux)
+            .concatWith(autoSnapFlux)
+            .concatWith(fluxUpdRscDfns)
+            .concatWith(Flux.merge(specialPropFluxes))
+            .concatWith(shippingFlux);
+    }
+
+    public Flux<ApiCallRc> setCtrlConfig(
+        ControllerConfigApi config
+    )
+    {
+        return scopeRunner
+            .fluxInTransactionlessScope(
+                "set controller config",
+                lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.CTRL_CONFIG),
+                () -> setCtrlConfigInScope(config)
+            );
+    }
+
+    private Flux<ApiCallRc> setCtrlConfigInScope(ControllerConfigApi config)
+        throws IOException
+    {
+        ResponseContext context = makeCtrlConfContext(ApiOperation.makeModifyOperation());
+        String logLevel = config.getLogLevel();
+        String logLevelLinstor = config.getLogLevelLinstor();
+        String logLevelGlobal = config.getLogLevelGlobal();
+        String logLevelLinstorGlobal = config.getLogLevelLinstorGlobal();
+        if (!(logLevel == null || logLevel.isEmpty()))
+        {
+            if (!(logLevelLinstor == null || logLevelLinstor.isEmpty()))
+            {
+                LinstorParsingUtils.asLogLevel(logLevel);
+                LinstorParsingUtils.asLogLevel(logLevelLinstor);
+                ctrlCfg.setLogLevel(logLevel);
+                ctrlCfg.setLogLevelLinstor(logLevelLinstor);
+                errorReporter.setLogLevel(
+                    Level.valueOf(logLevel.toUpperCase()),
+                    Level.valueOf(logLevelLinstor.toUpperCase())
+                );
+            }
+            else
+            {
+                if (!(logLevelLinstorGlobal == null || logLevelLinstorGlobal.isEmpty()))
+                {
+                    LinstorParsingUtils.asLogLevel(logLevel);
+                    LinstorParsingUtils.asLogLevel(logLevelLinstorGlobal);
+                    ctrlCfg.setLogLevel(logLevel);
+                    ctrlCfg.setLogLevelLinstor(logLevelLinstorGlobal);
+                    errorReporter.setLogLevel(
+                        Level.valueOf(logLevel.toUpperCase()),
+                        Level.valueOf(logLevelLinstorGlobal.toUpperCase())
+                    );
+                }
+                else
+                {
+                    LinstorParsingUtils.asLogLevel(logLevel);
+                    ctrlCfg.setLogLevel(logLevel);
+                    errorReporter
+                        .setLogLevel(Level.valueOf(logLevel.toUpperCase()), null);
+                }
+            }
+        }
+        else
+        {
+            if (!(logLevelGlobal == null || logLevelGlobal.isEmpty()))
+            {
+                if (!(logLevelLinstor == null || logLevelLinstor.isEmpty()))
+                {
+                    LinstorParsingUtils.asLogLevel(logLevelGlobal);
+                    LinstorParsingUtils.asLogLevel(logLevelLinstor);
+                    ctrlCfg.setLogLevel(logLevelGlobal);
+                    ctrlCfg.setLogLevelLinstor(logLevelLinstor);
+                    errorReporter
+                        .setLogLevel(
+                            Level.valueOf(logLevelGlobal.toUpperCase()),
+                            Level.valueOf(logLevelLinstor.toUpperCase())
+                        );
+                }
+                else
+                {
+                    if (!(logLevelLinstorGlobal == null || logLevelLinstorGlobal.isEmpty()))
+                    {
+                        LinstorParsingUtils.asLogLevel(logLevelGlobal);
+                        LinstorParsingUtils.asLogLevel(logLevelLinstorGlobal);
+                        ctrlCfg.setLogLevel(logLevelGlobal);
+                        ctrlCfg.setLogLevelLinstor(logLevelLinstorGlobal);
+                        errorReporter
+                            .setLogLevel(
+                                Level.valueOf(logLevelGlobal.toUpperCase()),
+                                Level.valueOf(logLevelLinstorGlobal.toUpperCase())
+                            );
+                    }
+                    else
+                    {
+                        LinstorParsingUtils.asLogLevel(logLevelGlobal);
+                        ctrlCfg.setLogLevel(logLevelGlobal);
+                        errorReporter.setLogLevel(Level.valueOf(logLevelGlobal.toUpperCase()), null
+                        );
+                    }
+                }
+            }
+            else
+            {
+                if (!(logLevelLinstor == null || logLevelLinstor.isEmpty()))
+                {
+                    LinstorParsingUtils.asLogLevel(logLevelLinstor);
+                    ctrlCfg.setLogLevelLinstor(logLevelLinstor);
+                    errorReporter
+                        .setLogLevel(null, Level.valueOf(logLevelLinstor.toUpperCase()));
+                }
+                else
+                {
+                    if (!(logLevelLinstorGlobal == null || logLevelLinstorGlobal.isEmpty()))
+                    {
+                        LinstorParsingUtils.asLogLevel(logLevelLinstorGlobal);
+                        ctrlCfg.setLogLevelLinstor(logLevelLinstorGlobal);
+                        errorReporter.setLogLevel(null, Level.valueOf(logLevelLinstorGlobal.toUpperCase())
+                        );
+                    }
+                }
+            }
+        }
+
+        Flux<ApiCallRc> flux;
+        if ((logLevelGlobal == null || logLevelGlobal.isEmpty()) &&
+            (logLevelLinstorGlobal == null || logLevelLinstorGlobal.isEmpty()))
+        {
+            ApiCallRc rc = ApiCallRcImpl.singleApiCallRc(
+                ApiConsts.MODIFIED | ApiConsts.MASK_CTRL_CONF,
+                "Successfully updated controller config"
+            );
+            flux = Flux.just(rc);
+        }
+        else
+        {
+            SatelliteConfig stltConf = new SatelliteConfig();
+            stltConf.log = new JsonGenTypes.SatelliteConfigLog();
+            stltConf.log.level = logLevelGlobal;
+            stltConf.log.level_linstor = logLevelLinstorGlobal;
+            flux = ctrlNodeApiCallHandler.setGlobalConfig(new SatelliteConfigPojo(stltConf));
+        }
+        return flux.transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private static class SatelliteConfigPojo implements SatelliteConfigApi
+    {
+        private final SatelliteConfig config;
+
+        SatelliteConfigPojo(SatelliteConfig configRef)
+        {
+            config = configRef;
+        }
+
+        @Override
+        public @Nullable String getLogLevel()
+        {
+            return config.log.level;
+        }
+
+        @Override
+        public @Nullable String getLogLevelLinstor()
+        {
+            return config.log.level_linstor;
+        }
+    }
+
+    public static ResponseContext makeCtrlConfContext(
+        ApiOperation operation
+    )
+    {
+        Map<String, String> objRefs = new TreeMap<>();
+
+        return new ResponseContext(
+            operation,
+            "Controller",
+            "controller",
+            ApiConsts.MASK_CTRL_CONF,
+            objRefs
+        );
+    }
+
+    private PairNonNull<ApiCallRc, Boolean> deleteNamespace(
+        String deleteNamespaceRef,
+        Map<String, PropertyChangedListener> propsChangedListenersRef
+    )
+    {
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        boolean notifyStlts = false;
+        @Nullable Props optNamespace = systemConfRepository.getCtrlConfForChange()
+            .getNamespace(deleteNamespaceRef);
+        if (optNamespace != null)
+        {
+            // the map keys cover the entire subtree (including sub-namespaces), each already
+            // containing the full path - copy them first since deleteProp modifies the
+            // underlying containers.
+            // deleteProp is used per key instead of Props.removeNamespace to keep the whitelist
+            // check, the satellite conf handling and the per-key side effects (listeners,
+            // port range reloads, ...)
+            List<String> fullPathKeys = new ArrayList<>(optNamespace.map().keySet());
+            for (String fullPathKey : fullPathKeys)
+            {
+                TripleNonNull<ApiCallRc, Boolean, Set<Resource>> result = deleteProp(
+                    fullPathKey,
+                    null,
+                    propsChangedListenersRef
+                );
+                apiCallRc.addEntries(result.objA);
+                notifyStlts |= result.objB;
+            }
+        }
+        return new PairNonNull<>(apiCallRc, notifyStlts);
+    }
+
+    private boolean setCtrlProp(
+        String key,
+        String value,
+        @Nullable String namespace,
+        PropertyChangedListener propChangedListenerRef
+    )
+        throws InvalidValueException, DatabaseException, InvalidKeyException
+    {
+        String oldVal = systemConfRepository.setCtrlProp(key, value, namespace);
+        if (propChangedListenerRef != null)
+        {
+            propChangedListenerRef.changed(key, value, oldVal);
+        }
+        boolean changed;
+        if (oldVal != null)
+        {
+            changed = !oldVal.equals(value);
+        }
+        else
+        {
+            changed = true;
+        }
+        return changed;
+    }
+
+    private boolean setStltProp(
+        String key,
+        String value,
+        PropertyChangedListener propChangedListenerRef
+    )
+        throws InvalidValueException, DatabaseException, InvalidKeyException
+    {
+        String oldVal = systemConfRepository.setStltProp(key, value);
+        if (propChangedListenerRef != null)
+        {
+            propChangedListenerRef.changed(key, value, oldVal);
+        }
+        boolean changed;
+        if (oldVal != null)
+        {
+            changed = !oldVal.equals(value);
+        }
+        else
+        {
+            changed = true;
+        }
+        return changed;
+    }
+
+    /**
+     * Trigger update auto-verify-algorithm for all resource definitions.
+     * This is called on global enable/disable operations.
+     * @return Pair of ApiCallRc and resources that got updated.
+     */
+    private PairNonNull<ApiCallRc, Set<Resource>> updateRscDfnsVerifyAlgo()
+    {
+        final Set<Resource> touchedResources = new HashSet<>();
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        for (ResourceDefinition rscDfn : rscDfnMap.values())
+        {
+            PairNonNull<ApiCallRc, Set<Resource>> result = ctrlRscDfnAutoVerifyAlgoHelper.updateVerifyAlgorithm(rscDfn);
+            apiCallRc.addEntries(result.objA);
+            touchedResources.addAll(result.objB);
+        }
+        return new PairNonNull<>(apiCallRc, touchedResources);
+    }
+
+    private void updateBalanceResourcesTaskSchedule(String newValue)
+    {
+        try
+        {
+            long newDelay = Long.parseLong(newValue);
+            taskScheduleService.rescheduleIn(balanceResourcesTask, newDelay * 1000L);
+        }
+        catch (NumberFormatException nfe)
+        {
+            errorReporter.logError("%s property number format exception, keeping old value",
+                ApiConsts.KEY_BALANCE_RESOURCES_INTERVAL);
+            errorReporter.reportError(nfe);
+        }
+    }
+
+    public TripleNonNull<ApiCallRc, Boolean, Set<Resource>> setProp(
+        String key,
+        @Nullable String namespace,
+        String value,
+        Map<String, PropertyChangedListener> propsChangedListenersRef
+    )
+    {
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        Set<Resource> changedRscs = new HashSet<>();
+        boolean notifyStlts = false;
+        try
+        {
+            String fullKey;
+            if (namespace != null && !"".equals(namespace.trim()))
+            {
+                fullKey = namespace + "/" + key;
+            }
+            else
+            {
+                fullKey = key;
+            }
+            List<String> ignoredKeys = new ArrayList<>();
+            ignoredKeys.add(ApiConsts.NAMESPC_AUXILIARY + "/");
+            ignoredKeys.add(ApiConsts.NAMESPC_EBS + "/" + ApiConsts.NAMESPC_TAGS + "/");
+
+            if (fullKey.startsWith(ApiConsts.NAMESPC_CLUSTER_REMOTE))
+            {
+                /*
+                 * special rules for "Cluster/Remote" namespace: key must be UUID and value must be unique
+                 */
+                handleClusterRemoteNamespace(apiCallRc, fullKey, value);
+            }
+            else
+            if (whitelistProps.isAllowed(LinStorObject.CTRL, ignoredKeys, fullKey, value, false))
+            {
+                String normalized = whitelistProps.normalize(LinStorObject.CTRL, fullKey, value);
+
+                PropertyChangedListener propChangedListener = propsChangedListenersRef.get(fullKey);
+                if (fullKey.startsWith(ApiConsts.NAMESPC_REST + '/') ||
+                    fullKey.startsWith(ApiConsts.NAMESPC_AUTOPLACER + "/"))
+                {
+                    notifyStlts = setCtrlProp(key, normalized, namespace, propChangedListener);
+                }
+                else
+                {
+                    switch (fullKey)
+                    {
+                        case ApiConsts.KEY_TCP_PORT_AUTO_RANGE:
+                            setTcpPort(key, namespace, normalized, null, apiCallRc, propChangedListener);
+                            break;
+                        case ApiConsts.KEY_MINOR_NR_AUTO_RANGE:
+                            setMinorNr(key, namespace, normalized, apiCallRc, propChangedListener);
+                            break;
+                        case ApiConsts.NAMESPC_SNAPSHOT_SHIPPING + "/" + ApiConsts.KEY_TCP_PORT_RANGE:
+                            setTcpPort(key, namespace, normalized, backupShipPortPool, apiCallRc, propChangedListener);
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_AUTO_ADD_QUORUM_TIEBREAKER:
+                            notifyStlts = setCtrlProp(
+                                key,
+                                normalized,
+                                namespace,
+                                propChangedListener
+                            );
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_AUTO_QUORUM:
+                            apiCallRc.add(ApiCallRcImpl.simpleEntry(ApiConsts.WARN_DEPRECATED,
+                                fullKey + " is deprecated, please use " +
+                                    ApiConsts.NAMESPC_DRBD_RESOURCE_OPTIONS + "/" + InternalApiConsts.KEY_DRBD_QUORUM));
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_RESOURCE_OPTIONS + "/" + InternalApiConsts.KEY_DRBD_QUORUM:
+                            setCtrlProp(
+                                ApiConsts.KEY_QUORUM_SET_BY,
+                                "user",
+                                ApiConsts.NAMESPC_INTERNAL_DRBD,
+                                propChangedListener
+                            );
+
+                            notifyStlts = setCtrlProp(
+                                key,
+                                normalized,
+                                namespace,
+                                propChangedListener
+                            );
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_AUTO_VERIFY_ALGO_ALLOWED_USER:
+                            notifyStlts = setCtrlProp(
+                                key,
+                                normalized,
+                                namespace,
+                                propChangedListener
+                            );
+                            updateRscDfnsVerifyAlgo();
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_DISABLE_AUTO_RESYNC_AFTER:
+                        {
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                            PairNonNull<ApiCallRc, Set<Resource>> result;
+                            if (normalized.equalsIgnoreCase("true"))
+                            {
+                                result = ctrlResyncAfterHelper.clearAllResyncAfterProps();
+                            }
+                            else
+                            {
+                                result = ctrlResyncAfterHelper.manage();
+                            }
+                            apiCallRc.addEntries(result.objA);
+                            changedRscs.addAll(result.objB);
+                            notifyStlts = true;
+                        }
+                            break;
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_DISABLE_AUTO_VERIFY_ALGO:
+                        {
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                            // also set on satellite, so conffile builder can ignore if disabled
+                            setStltProp(fullKey, normalized, propChangedListener);
+                            PairNonNull<ApiCallRc, Set<Resource>> result = updateRscDfnsVerifyAlgo();
+                            apiCallRc.addEntries(result.objA);
+                            // ignore touched resources, as we disable auto-verify-algo by conf file builder global prop
+                            notifyStlts = true;
+                        }
+                            break;
+                        case ApiConsts.KEY_BALANCE_RESOURCES_INTERVAL:
+                        {
+                            updateBalanceResourcesTaskSchedule(normalized);
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                        }
+                            break;
+                        case Autoplacer.MIN_FREE_SPACE_PROP:
+                            SizeSpecParser.ensureParsableWithPercent(normalized);
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                            break;
+                        case ApiConsts.KEY_AUTOPLACE_ALLOW_TARGET: // fall-through
+                        case ApiConsts.KEY_SEARCH_DOMAIN: // fall-through
+                        case ApiConsts.KEY_STOR_POOL_MAX_FREE_CAPACITY_OVERSUBSCRIPTION_RATIO: // fall-through
+                        case ApiConsts.KEY_STOR_POOL_MAX_OVERSUBSCRIPTION_RATIO: // fall-through
+                        case ApiConsts.KEY_STOR_POOL_MAX_TOTAL_CAPACITY_OVERSUBSCRIPTION_RATIO: // fall-through
+                        case ApiConsts.KEY_UPDATE_CACHE_INTERVAL:
+                            // fall-through
+                        case ApiConsts.KEY_BALANCE_RESOURCES_ENABLED: // fall-through
+                        case ApiConsts.KEY_BALANCE_RESOURCES_GRACE_PERIOD:
+                            // fall-through
+                        case ApiConsts.KEY_BALANCE_RESOURCES_SKIP_DISK_LIMIT:
+                            // fall-through
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_AUTO_EVICT_ALLOW_EVICTION:
+                            // fall-through
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_AUTO_EVICT_AFTER_TIME:
+                            // fall-through
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_AUTO_EVICT_MAX_DISCONNECTED_NODES:
+                            // fall-through
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_AUTO_EVICT_MIN_REPLICA_COUNT:
+                            // fall-through
+                        case ApiConsts.NAMESPC_BACKUP_SHIPPING + ReadOnlyProps.PATH_SEPARATOR +
+                            ApiConsts.KEY_ALLOW_FORCE_RESTORE:
+                            // fall-through
+                        case BackupConsts.CONCURRENT_BACKUPS_KEY:
+                            // fall-through
+                        case ApiConsts.KEY_RSC_ALLOW_MIXING_DEVICE_KIND:
+                            // fall-through
+                        case ApiConsts.NAMESPC_CLONE + "/" + ApiConsts.KEY_BALANCE_AFTER_CLONE:
+                            // fall-through
+                        case ApiConsts.NAMESPC_SNAPSHOT + "/" + ApiConsts.KEY_BALANCE_AFTER_RESTORE:
+                            // fall-through
+                        case ZfsRollbackStrategy.FULL_KEY_USE_ZFS_ROLLBACK_PROP:
+                            // fall-through
+                        case ZfsDeleteStrategy.FULL_KEY_ZFS_DELETE_STRATEGY:
+                            // fall-through
+                        case ApiConsts.NAMESPC_AUTH + "/" + ApiConsts.KEY_TOKEN_AUTH_ENABLED:
+                            // fall-through
+                        case ApiConsts.NAMESPC_LINSTOR_DRBD + "/" + ApiConsts.KEY_DRBD_AUTO_BLOCK_SIZE:
+                            // fall-through
+                        case ApiConsts.NAMESPC_DRBD_PROXY + "/" + ApiConsts.KEY_DRBD_PROXY_AUTO_ENABLE:
+                            // fall-through
+                        case ApiConsts.NAMESPC_LOGGING + "/" + ApiConsts.KEY_LOG_ARCHIVE_AGE_DAYS:
+                            // no need to update stlts
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                            break;
+                        case AutoDbExportTask.FULL_KEY_CRON: // fall-through
+                        case AutoDbExportTask.FULL_KEY_KEEP: // fall-through
+                        case AutoDbExportTask.FULL_KEY_PATH: // fall-through
+                        case AutoDbExportTask.FULL_KEY_COMPRESS:
+                            setCtrlProp(key, normalized, namespace, propChangedListener);
+                            autoDbExportTask.updateProps(apiCallRc);
+                            break;
+
+                        case ApiConsts.KEY_EXT_CMD_WAIT_TO: // deprecated
+                            String mappedKey = ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_WAIT_TO;
+                            apiCallRc.add(ApiCallRcImpl.simpleEntry(
+                                ApiConsts.WARN_DEPRECATED,
+                                "'" + fullKey + "' is deprecated, please use '" + mappedKey + "'"
+                            ));
+                            fullKey = mappedKey;
+                            // fall-through with re-mapped fullKey
+                        case ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_WAIT_TO:
+                        case ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_TERM_TO:
+                        case ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_KILL_TO:
+                        case ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_IO_STALL_TO:
+                        case ApiConsts.NAMESPC_EXT_CMD + "/" + ApiConsts.KEY_IO_POLL_INTERVAL:
+                            notifyStlts = applyExtCmdTimeout(fullKey, normalized, propChangedListener);
+                            break;
+                        default:
+                            notifyStlts = setStltProp(fullKey, normalized, propChangedListener);
+                            break;
+                    }
+                }
+
+                apiCallRc.addEntry(
+                    "Successfully set property '" + fullKey + "' to value '" + normalized + "'",
+                    ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT | ApiConsts.CREATED
+                );
+            }
+            else
+            {
+                ApiCallRcEntry entry = new ApiCallRcEntry();
+                if (whitelistProps.isKeyKnown(LinStorObject.CTRL, fullKey))
+                {
+                    entry.setMessage("The value '" + value + "' is not valid.");
+                    entry.setDetails(
+                        whitelistProps.getErrMsg(LinStorObject.CTRL, fullKey)
+                    );
+                }
+                else
+                {
+                    entry.setMessage("Invalid property key: " + fullKey);
+                    entry.setCause(CtrlPropsHelper.causeInvalidPropKey(fullKey));
+                    entry.setCorrection(CtrlPropsHelper.CORRECTION_INVALID_PROP_KEY);
+                }
+                entry.setReturnCode(ApiConsts.FAIL_INVLD_PROP | ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT);
+                entry.setSkipErrorReport(true);
+                apiCallRc.addEntry(entry);
+            }
+        }
+        catch (ApiRcException apiRcExc)
+        {
+            boolean createErrorReport = false;
+            for (RcEntry rcEntry : apiRcExc.getApiCallRc())
+            {
+                if (!rcEntry.skipErrorReport())
+                {
+                    createErrorReport = true;
+                    break;
+                }
+            }
+            if (createErrorReport)
+            {
+                errorReporter.reportError(apiRcExc);
+            }
+        }
+        catch (Exception exc)
+        {
+            String errorMsg;
+            long rc;
+            boolean createErrorReport = false;
+            if (exc instanceof InvalidKeyException invKeyExc)
+            {
+                errorMsg = "Invalid key: " + invKeyExc.invalidKey;
+                rc = ApiConsts.FAIL_INVLD_PROP;
+            }
+            else
+            if (exc instanceof InvalidValueException)
+            {
+                errorMsg = "Invalid value: " + value;
+                rc = ApiConsts.FAIL_INVLD_PROP;
+            }
+            else
+            if (exc instanceof DatabaseException)
+            {
+                errorMsg = ResponseUtils.getSqlMsg(
+                    "Persisting controller config prop with key '" + key + "' in namespace '" + namespace +
+                    "' with value '" + value + "'."
+                );
+                rc = ApiConsts.FAIL_SQL;
+                createErrorReport = true;
+            }
+            else
+            {
+                errorMsg = "An exception of type " + exc.getClass().getSimpleName() +
+                    " occurred while setting controller config prop with key '" +
+                    key + "' in namespace '" + namespace + "' with value '" + value + "'.";
+                rc = ApiConsts.FAIL_UNKNOWN_ERROR;
+                createErrorReport = true;
+            }
+
+            apiCallRc.addEntry(ApiCallRcImpl.simpleEntry(
+                rc | ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT, errorMsg, !createErrorReport));
+            if (createErrorReport)
+            {
+                errorReporter.reportError(
+                    exc,
+                    null,
+                    errorMsg
+                );
+            }
+        }
+        return new TripleNonNull<>(apiCallRc, notifyStlts, changedRscs);
+    }
+
+    private boolean applyExtCmdTimeout(String fullKey, String value, PropertyChangedListener propChangedListenerRef)
+        throws InvalidKeyException, DatabaseException, InvalidValueException
+    {
+        long timeout;
+        try
+        {
+            timeout = Long.parseLong(value);
+        }
+        catch (NumberFormatException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_PROP,
+                    "The " + fullKey + " has to have a numeric value"
+                ),
+                exc
+            );
+        }
+        if (timeout < 0)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_PROP,
+                    "The " + fullKey + " must not be negative"
+                )
+            );
+        }
+        boolean notifyStlt = setStltProp(fullKey, value, propChangedListenerRef);
+        ChildProcessHandler.applyTimeoutProps(systemConfRepository.getStltConfForView());
+        return notifyStlt;
+    }
+
+    private void handleClusterRemoteNamespace(ApiCallRcImpl apiCallRc, String fullKey, String value)
+        throws InvalidKeyException, DatabaseException, InvalidValueException
+    {
+        ApiCallRcEntry entry = null;
+
+        // +1 for the trailing "/"
+        String actualKey = fullKey.substring(ApiConsts.NAMESPC_CLUSTER_REMOTE.length() + 1);
+        if (UuidUtils.isUuid(actualKey))
+        {
+            if (systemConfRepository.getCtrlConfForView().values().contains(value))
+            {
+                entry = new ApiCallRcEntry();
+                entry.setMessage("The value '" + value + "' is already used for another remote cluster");
+            }
+            else if (value.length() > MAX_REMOTE_NAME_LEN)
+            {
+                entry = new ApiCallRcEntry();
+                entry.setMessage("The value '" + value + "' is longer than " + MAX_REMOTE_NAME_LEN);
+            }
+        }
+        else
+        {
+            entry = new ApiCallRcEntry();
+            entry.setMessage("The key '" + actualKey + "' must be a valid UUID");
+        }
+        if (entry != null)
+        {
+            entry.setReturnCode(ApiConsts.FAIL_INVLD_PROP | ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT);
+            apiCallRc.addEntry(entry);
+        }
+        else
+        {
+            systemConfRepository.getCtrlConfForChange().setProp(
+                actualKey,
+                value,
+                ApiConsts.NAMESPC_CLUSTER_REMOTE
+            );
+            // no need to update satellites
+            transMgrProvider.get().commit();
+
+            apiCallRc.addEntry(
+                "Successfully set property '" + fullKey + "' to value '" + value + "'",
+                ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT | ApiConsts.CREATED
+            );
+
+        }
+    }
+
+    private ApiCallRc handleNetComModifications(
+        HashMap<String, String> filteredOverrideProps,
+        HashSet<String> filteredDeletePropKeys,
+        HashSet<String> filteredDeleteNamespaces,
+        Map<String, PropertyChangedListener> propsChangedListenersRef
+    )
+    {
+        // just apply all netcom props and perform sanity checks later
+        String currentKey = null;
+        String currentValue = null;
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        try
+        {
+            HashSet<String> connectorsToCheck = new HashSet<>();
+            Iterator<Entry<String, String>> overrideIterator = filteredOverrideProps.entrySet().iterator();
+            while (overrideIterator.hasNext())
+            {
+                Entry<String, String> overrideProp = overrideIterator.next();
+                currentKey = overrideProp.getKey();
+                currentValue = overrideProp.getValue();
+                String[] splitByNamespaces = StringUtils.split(currentKey, "/");
+                if (currentKey.startsWith(ApiConsts.NAMESPC_NETCOM) && splitByNamespaces.length == 3)
+                {
+                    String normalized = whitelistProps.normalize(LinStorObject.CTRL, currentKey, currentValue);
+                    setCtrlProp(
+                        currentKey,
+                        normalized,
+                        null,
+                        propsChangedListenersRef.get(currentKey)
+                    );
+                    connectorsToCheck.add(splitByNamespaces[1]);
+                    overrideIterator.remove(); // remove the prop to not being forwarded to the default handler
+                }
+            }
+            currentValue = null;
+            Iterator<String> deletePropIterator = filteredDeletePropKeys.iterator();
+            while (deletePropIterator.hasNext())
+            {
+                currentKey = deletePropIterator.next();
+                String[] splitByNamespaces = StringUtils.split(currentKey, "/");
+                if (currentKey.startsWith(ApiConsts.NAMESPC_NETCOM) && splitByNamespaces.length == 3)
+                {
+                    systemConfRepository.removeCtrlProp(currentKey, null);
+                    connectorsToCheck.add(splitByNamespaces[1]);
+                    deletePropIterator.remove(); // remove the prop to not being forwarded to the default handler
+                }
+            }
+
+            Iterator<String> deleteNamespaceIterator = filteredDeleteNamespaces.iterator();
+            while (deleteNamespaceIterator.hasNext())
+            {
+                currentKey = deleteNamespaceIterator.next();
+                String[] splitByNamespaces = StringUtils.split(currentKey, "/");
+                if (currentKey.startsWith(ApiConsts.NAMESPC_NETCOM) && splitByNamespaces.length == 2)
+                {
+                    @Nullable Props optNamespace = systemConfRepository.getCtrlConfForChange()
+                        .getNamespace(currentKey);
+                    if (optNamespace != null)
+                    {
+                        Iterator<String> keysIterator = optNamespace.keysIterator();
+                        while (keysIterator.hasNext())
+                        {
+                            String actualKey = keysIterator.next();
+                            systemConfRepository.removeCtrlProp(actualKey, null);
+                        }
+                    }
+                    deleteNamespaceIterator.remove(); // remove the prop to not being forwarded to the default handler
+                }
+            }
+
+            boolean abort = false;
+            if (!connectorsToCheck.isEmpty())
+            {
+                @Nullable Props ctrlProps = systemConfRepository.getCtrlConfForChange()
+                    .getNamespace(ApiConsts.NAMESPC_NETCOM);
+                if (ctrlProps != null)
+                {
+                    for (String connectorToCheck : connectorsToCheck)
+                    {
+                        @Nullable Props conNamespace = ctrlProps.getNamespace(connectorToCheck);
+                        if (conNamespace != null)
+                        {
+                            List<String> errorMessages = new ArrayList<>();
+
+                            BiConsumer<String, String> addErrorIfNull = (value, missingKey) ->
+                            {
+                                if (value == null)
+                                {
+                                    errorMessages.add(String.format(
+                                        "NetComConnector '%s' is missing '%s' key.", connectorToCheck, missingKey));
+                                }
+                            };
+
+                            String enabled = conNamespace.getProp(ApiConsts.KEY_NETCOM_ENABLED);
+                            String bindAddress = conNamespace.getProp(ApiConsts.KEY_NETCOM_BIND_ADDRESS);
+                            String keyPasswd = conNamespace.getProp(ApiConsts.KEY_NETCOM_KEY_PASSWD);
+                            String keyStore = conNamespace.getProp(ApiConsts.KEY_NETCOM_KEY_STORE);
+                            String keyStorePasswd = conNamespace.getProp(ApiConsts.KEY_NETCOM_KEY_STORE_PASSWD);
+                            String port = conNamespace.getProp(ApiConsts.KEY_NETCOM_PORT);
+                            String sslProtocol = conNamespace.getProp(ApiConsts.KEY_NETCOM_SSL_PROTOCOL);
+                            String trustStore = conNamespace.getProp(ApiConsts.KEY_NETCOM_TRUST_STORE);
+                            String trustStorePasswd = conNamespace.getProp(ApiConsts.KEY_NETCOM_TRUST_STORE_PASSWD);
+                            String type = conNamespace.getProp(ApiConsts.KEY_NETCOM_TYPE);
+
+                            addErrorIfNull.accept(bindAddress, ApiConsts.KEY_NETCOM_BIND_ADDRESS);
+                            addErrorIfNull.accept(type, ApiConsts.KEY_NETCOM_TYPE);
+                            addErrorIfNull.accept(port, ApiConsts.KEY_NETCOM_PORT);
+                            addErrorIfNull.accept(enabled, ApiConsts.KEY_NETCOM_ENABLED);
+
+                            if (ApiConsts.VAL_NETCOM_TYPE_SSL.equalsIgnoreCase(type))
+                            {
+                                addErrorIfNull.accept(keyPasswd, ApiConsts.KEY_NETCOM_KEY_PASSWD);
+                                addErrorIfNull.accept(keyStore, ApiConsts.KEY_NETCOM_KEY_STORE);
+                                addErrorIfNull.accept(keyStorePasswd, ApiConsts.KEY_NETCOM_KEY_STORE_PASSWD);
+                                addErrorIfNull.accept(sslProtocol, ApiConsts.KEY_NETCOM_SSL_PROTOCOL);
+                                addErrorIfNull.accept(trustStore, ApiConsts.KEY_NETCOM_TRUST_STORE);
+                                addErrorIfNull.accept(trustStorePasswd, ApiConsts.KEY_NETCOM_TRUST_STORE_PASSWD);
+                            }
+
+                            // normalize the 'enabled' property. we cannot use the whitelist normialization as we have
+                            // no whitelist rule for these (special) netcom namespace
+                            boolean isEnabled;
+                            if (ApiConsts.VAL_TRUE.equalsIgnoreCase(enabled))
+                            {
+                                isEnabled = true;
+                                if (!ApiConsts.VAL_TRUE.equals(enabled))
+                                {
+                                    conNamespace.setProp(ApiConsts.KEY_NETCOM_ENABLED, ApiConsts.VAL_TRUE);
+                                }
+                            }
+                            else if (ApiConsts.VAL_FALSE.equalsIgnoreCase(enabled))
+                            {
+                                isEnabled = false;
+                                if (!ApiConsts.VAL_FALSE.equals(enabled))
+                                {
+                                    conNamespace.setProp(ApiConsts.KEY_NETCOM_ENABLED, ApiConsts.VAL_FALSE);
+                                }
+                            }
+                            else
+                            {
+                                // nothing valid
+                                isEnabled = false;
+                            }
+
+                            if (!errorMessages.isEmpty())
+                            {
+                                apiCallRc.addEntry(
+                                    ApiCallRcImpl.simpleEntry(
+                                        isEnabled ? ApiConsts.FAIL_INVLD_CONF : ApiConsts.WARN_INVLD_CONF,
+                                        StringUtils.join(errorMessages, "\n"),
+                                        true
+                                    )
+                                );
+                                abort = isEnabled;
+                            }
+                        }
+                    }
+                }
+            }
+            if (abort)
+            {
+                transMgrProvider.get().rollback();
+                apiCallRc.addEntry(
+                    ApiCallRcImpl.simpleEntry(ApiConsts.FAIL_INVLD_CONF, "Invalid configurations were rolled back")
+                );
+            }
+            else
+            {
+                transMgrProvider.get().commit();
+                // TODO: restart valid but changed netCom services
+            }
+        }
+        catch (Exception exc)
+        {
+            String errorMsg;
+            long rc;
+            if (exc instanceof InvalidKeyException invKeyExc)
+            {
+                errorMsg = "Invalid key: " + invKeyExc.invalidKey;
+                rc = ApiConsts.FAIL_INVLD_PROP;
+            }
+            else if (exc instanceof InvalidValueException)
+            {
+                errorMsg = "Invalid value: " + currentValue + " for key: " + currentKey;
+                rc = ApiConsts.FAIL_INVLD_PROP;
+            }
+            else if (exc instanceof DatabaseException)
+            {
+                errorMsg = ResponseUtils.getSqlMsg(
+                    "Persisting controller config prop with key '" + currentKey + "' with value '" + currentValue + "'."
+                );
+                rc = ApiConsts.FAIL_SQL;
+            }
+            else
+            {
+                errorMsg = "An exception of type " + exc.getClass().getSimpleName() +
+                    " occurred while setting netcom (controller) config prop with key '" +
+                    currentKey + "' with value '" + currentValue + "'.";
+                rc = ApiConsts.FAIL_UNKNOWN_ERROR;
+            }
+
+            apiCallRc.addEntry(errorMsg, rc | ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_CRT);
+            errorReporter.reportError(
+                exc,
+                null,
+                errorMsg
+            );
+        }
+        return apiCallRc;
+    }
+
+    public Map<String, String> listProps()
+    {
+        Map<String, String> mergedMap = new TreeMap<>();
+        try
+        {
+            mergedMap.putAll(systemConfRepository.getCtrlConfForView().map());
+            mergedMap.putAll(systemConfRepository.getStltConfForView().map());
+        }
+        catch (Exception ignored)
+        {
+            // empty list
+        }
+        return mergedMap;
+    }
+
+    public Flux<ApiCallRc> deletePropWithCommit(String key, String namespace)
+    {
+        ResponseContext context = makeCtrlConfContext(
+            ApiOperation.makeDeleteOperation()
+        );
+
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "deletePropWithCommit",
+                lockGuardFactory.buildDeferred(WRITE, LockObj.CTRL_CONFIG),
+                () -> deletePropWithCommitInTransaction(key, namespace)
+            )
+            .transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    public Flux<ApiCallRc> deletePropWithCommitInTransaction(String key, String namespace)
+    {
+        TripleNonNull<ApiCallRc, Boolean, Set<Resource>> result = deleteProp(
+            key,
+            namespace,
+            new HashMap<>() // XXX is this method even called?
+        );
+        transMgrProvider.get().commit();
+        if (result.objB)
+        {
+            updateSatelliteConf();
+        }
+        Flux<ApiCallRc> fluxUpdRscDfns = Flux.empty();
+        for (Resource rsc : result.objC)
+        {
+            fluxUpdRscDfns = fluxUpdRscDfns.concatWith(
+                ctrlSatelliteUpdateCaller.updateSatellites(rsc, Flux.empty())
+                    .flatMap(updateTuple -> updateTuple == null ? Flux.empty() : updateTuple.getT2()));
+        }
+        return fluxUpdRscDfns.concatWith(Flux.just(result.objA));
+    }
+
+    private TripleNonNull<ApiCallRc, Boolean, Set<Resource>> deleteProp(
+        String key,
+        @Nullable String namespace,
+        Map<String, PropertyChangedListener> propsChangedListenersRef
+    )
+    {
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        boolean notifyStlts = false;
+        Set<Resource> changedRscs = new HashSet<>();
+        try
+        {
+            String fullKey;
+            if (namespace != null && !"".equals(namespace.trim()))
+            {
+                fullKey = namespace + "/" + key;
+            }
+            else
+            {
+                fullKey = key;
+            }
+            List<String> ignoredKeys = new ArrayList<>();
+            ignoredKeys.add(ApiConsts.NAMESPC_AUXILIARY + "/");
+            ignoredKeys.add(ApiConsts.NAMESPC_EBS + "/" + ApiConsts.NAMESPC_TAGS + "/");
+
+            boolean isPropWhitelisted = whitelistProps.isAllowed(
+                LinStorObject.CTRL,
+                ignoredKeys,
+                fullKey,
+                null,
+                false
+            );
+            if (isPropWhitelisted)
+            {
+                String oldValue = systemConfRepository.removeCtrlProp(key, namespace);
+                notifyStlts = systemConfRepository.removeStltProp(key, namespace) != null;
+
+                if (oldValue != null)
+                {
+                    notifyStlts = true;
+                    switch (fullKey)
+                    {
+                        case ApiConsts.KEY_TCP_PORT_AUTO_RANGE -> reloadAllNodesTcpPortPools();
+                        case ApiConsts.KEY_MINOR_NR_AUTO_RANGE -> minorNrPool.reloadRange();
+                        case ApiConsts.KEY_TCP_PORT_RANGE -> backupShipPortPool.reloadRange();
+                        case ApiConsts.NAMESPC_DRBD_RESOURCE_OPTIONS + "/" + InternalApiConsts.KEY_DRBD_QUORUM ->
+                            systemConfRepository.removeCtrlProp(ApiConsts.KEY_QUORUM_SET_BY, ApiConsts.NAMESPC_INTERNAL_DRBD);
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_DISABLE_AUTO_RESYNC_AFTER ->
+                        {
+                            PairNonNull<ApiCallRc, Set<Resource>> result = ctrlResyncAfterHelper.manage();
+                            apiCallRc.addEntries(result.objA);
+                            changedRscs.addAll(result.objB);
+                        }
+                        case ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_DISABLE_AUTO_VERIFY_ALGO ->
+                        {
+                            PairNonNull<ApiCallRc, Set<Resource>> result = updateRscDfnsVerifyAlgo();
+                            apiCallRc.addEntries(result.objA);
+                            changedRscs.addAll(result.objB);
+                        }
+                        case AutoDbExportTask.FULL_KEY_CRON, AutoDbExportTask.FULL_KEY_KEEP, // continued
+                            AutoDbExportTask.FULL_KEY_PATH, AutoDbExportTask.FULL_KEY_COMPRESS ->
+                            autoDbExportTask.updateProps(apiCallRc);
+
+                        // TODO: check for other properties
+                        default ->
+                        {
+                            // ignore - for now
+                        }
+                    }
+
+                    PropertyChangedListener listener = propsChangedListenersRef.get(fullKey);
+                    if (listener != null)
+                    {
+                        listener.changed(fullKey, null, oldValue);
+                    }
+                }
+
+                apiCallRc.addEntry(
+                    "Successfully deleted property '" + fullKey + "'",
+                    ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_DEL | ApiConsts.DELETED
+                );
+            }
+            else
+            {
+                ApiCallRcEntry entry = new ApiCallRcEntry();
+                entry.setMessage("Invalid property key: " + fullKey);
+                entry.setCause(CtrlPropsHelper.causeInvalidPropKey(fullKey));
+                entry.setCorrection(CtrlPropsHelper.CORRECTION_INVALID_PROP_KEY);
+                entry.setReturnCode(ApiConsts.FAIL_INVLD_PROP | ApiConsts.MASK_CTRL_CONF | ApiConsts.MASK_DEL);
+                apiCallRc.addEntry(entry);
+            }
+        }
+        catch (Exception exc)
+        {
+            String errorMsg;
+            long rc;
+            if (exc instanceof InvalidKeyException invKeyExc)
+            {
+                errorMsg = "Invalid key: " + invKeyExc.invalidKey;
+                rc = ApiConsts.FAIL_INVLD_PROP;
+            }
+            else
+            {
+                errorMsg = "An exception of type " + exc.getClass().getSimpleName() +
+                    " occurred while deleting controller config prop with key '" +
+                    key + "' in namespace '" + namespace + "'.";
+                rc = ApiConsts.FAIL_UNKNOWN_ERROR;
+            }
+
+            apiCallRc.addEntry(errorMsg, rc);
+            errorReporter.reportError(
+                exc,
+                null,
+                errorMsg
+            );
+        }
+        return new TripleNonNull<>(apiCallRc, notifyStlts, changedRscs);
+    }
+
+    private void reloadAllNodesTcpPortPools()
+    {
+        for (Node node : nodesMap.values())
+        {
+            node.getTcpPortPool().reloadRange();
+        }
+    }
+
+    public LinstorEncryptionStatus masterPassphraseStatus()
+    {
+        LinstorEncryptionStatus status = LinstorEncryptionStatus.UNSET;
+        ReadOnlyProps namespace = encHelper.getEncryptedNamespace();
+        if (!(namespace == null || namespace.isEmpty()))
+        {
+            status = encHelper.isMasterKeyUnlocked() ?
+                LinstorEncryptionStatus.UNLOCKED : LinstorEncryptionStatus.LOCKED;
+        }
+        return status;
+    }
+
+    public Flux<ApiCallRc> enterPassphrase(String passphrase)
+    {
+        ResponseContext context = makeCtrlConfContext(
+            ApiOperation.makeModifyOperation()
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Entering passphrase",
+            lockGuardFactory.buildDeferred(WRITE, LockObj.CTRL_CONFIG),
+            () -> enterPassphraseInTransaction(
+                passphrase
+            )
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> enterPassphraseInTransaction(String passphrase)
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        try
+        {
+            ReadOnlyProps namespace = encHelper.getEncryptedNamespace();
+            if (namespace == null || namespace.isEmpty())
+            {
+                ResponseUtils.reportStatic(
+                    null,
+                    EncryptionHelper.NAMESPACE_ENCRYPTED + " namespace is empty, you need to set a passphrase first",
+                    ApiConsts.MASK_CTRL_CONF | ApiConsts.FAIL_MISSING_PROPS,
+                    null,
+                    true,
+                    apiCallRc,
+                    errorReporter,
+                    peerProvider.get()
+                );
+            }
+            else
+            {
+                byte[] decryptedMasterKey = encHelper.getDecryptedMasterKey(
+                    namespace,
+                    passphrase.getBytes(StandardCharsets.UTF_8)
+                );
+                flux = encHelper.setCryptKey(decryptedMasterKey, namespace, true);
+                // setCryptKey might have changed volatileRscData (ignoreReason, etc..)
+                transMgrProvider.get().commit();
+
+                ResponseUtils.reportSuccessStatic(
+                    "Passphrase accepted",
+                    null,
+                    ApiConsts.MASK_CTRL_CONF | ApiConsts.PASSPHRASE_ACCEPTED,
+                    apiCallRc,
+                    null,
+                    errorReporter
+                );
+            }
+        }
+        catch (InvalidKeyException exc)
+        {
+            ResponseUtils.reportStatic(
+                new ImplementationError(
+                    "Hardcoded namespace or property key invalid",
+                    exc
+                ),
+                "Hardcoded namespace or property key invalid",
+                ApiConsts.FAIL_IMPL_ERROR,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+        catch (MissingKeyPropertyException exc)
+        {
+            ResponseUtils.addAnswerStatic(
+                "Could not restore crypt passphrase as one of the following properties is not set:\n" +
+                    "'" + EncryptionHelper.KEY_CRYPT_HASH + "', '" + EncryptionHelper.KEY_CRYPT_KEY + "', '" +
+                    EncryptionHelper.KEY_PASSPHRASE_SALT + "'",
+                "This is either an implementation error or a user has manually removed one of the " +
+                    "mentioned protperties.",
+                null, // details
+                null, // correction
+                ApiConsts.MASK_MOD | ApiConsts.MASK_CTRL_CONF | ApiConsts.FAIL_MISSING_PROPS,
+                null, // objectRefs
+                null, // errorId
+                true,
+                apiCallRc
+            );
+        }
+        catch (IncorrectPassphraseException exc)
+        {
+            ResponseUtils.addAnswerStatic(
+                "Could not restore master passphrase as the given old passphrase was incorrect",
+                "Wrong passphrase", // cause
+                null, // details
+                "Enter the correct passphrase", // correction
+                ApiConsts.MASK_MOD | ApiConsts.MASK_CTRL_CONF | ApiConsts.FAIL_MISSING_PROPS,
+                null, // objectRefs
+                null, // errorId
+                true,
+                apiCallRc
+            );
+        }
+        catch (LinStorException exc)
+        {
+            ResponseUtils.reportStatic(
+                exc,
+                "An exception of type " + exc.getClass().getSimpleName() +
+                " occurred while validating the passphrase",
+                ApiConsts.FAIL_UNKNOWN_ERROR,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+
+        return Flux.<ApiCallRc>just(apiCallRc).concatWith(flux);
+    }
+
+    public Flux<ApiCallRc> setPassphrase(String newPassphrase, @Nullable String oldPassphrase)
+    {
+        ResponseContext context = makeCtrlConfContext(
+            ApiOperation.makeCreateOperation()
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            (oldPassphrase == null ? "Creating" : "Modifying") + " passphrase",
+            lockGuardFactory.buildDeferred(WRITE, LockObj.CTRL_CONFIG),
+            () -> setPassphraseInTransaction(
+                newPassphrase,
+                oldPassphrase
+            )
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> setPassphraseInTransaction(String newPassphrase, @Nullable String oldPassphrase)
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+        long mask = ApiConsts.MASK_CTRL_CONF;
+        try
+        {
+            ReadOnlyProps namespace = encHelper.getEncryptedNamespace();
+
+            if (oldPassphrase == null)
+            {
+                mask |= ApiConsts.MASK_CRT;
+                if (namespace == null || namespace.getProp(EncryptionHelper.KEY_CRYPT_KEY) == null)
+                {
+                    // no oldPassphrase and empty namespace means that
+                    // this is the initial passphrase
+                    byte[] masterKey = encHelper.generateSecret();
+                    encHelper.setPassphraseImpl(
+                        newPassphrase.getBytes(StandardCharsets.UTF_8),
+                        masterKey
+                    );
+                    // setPassphraseImpl sets the props in this namespace; to ensure they are there, get it again
+                    namespace = encHelper.getEncryptedNamespace();
+                    flux = encHelper.setCryptKey(masterKey, namespace, true);
+
+                    // setCryptKey could have changed voaltileRscData (ignoreReasons, etc...)
+                    transMgrProvider.get().commit();
+
+                    ResponseUtils.reportSuccessStatic(
+                         "Crypt passphrase created.",
+                         null, // details
+                         mask | ApiConsts.CREATED,
+                         apiCallRc,
+                         null, // objectRefs
+                         errorReporter
+                    );
+                }
+                else
+                {
+                    ResponseUtils.addAnswerStatic(
+                        "Could not create new crypt passphrase as it already exists",
+                        "A passphrase was already defined",
+                        null,
+                        "Use the crypt-modify-passphrase command instead of crypt-create-passphrase",
+                        mask | ApiConsts.FAIL_EXISTS_CRYPT_PASSPHRASE,
+                        new HashMap<>(),
+                        null, // errorId
+                        true,
+                        apiCallRc
+                    );
+                }
+            }
+            else
+            {
+                mask |= ApiConsts.MASK_MOD;
+                if (namespace == null || namespace.isEmpty())
+                {
+                    ResponseUtils.addAnswerStatic(
+                        "Could not modify crypt passphrase as it does not exist",
+                        "No passphrase was defined yet",
+                        null,
+                        "Use the crypt-create-passphrase command instead of crypt-modify-passphrase",
+                        mask | ApiConsts.FAIL_EXISTS_CRYPT_PASSPHRASE,
+                        new HashMap<>(),
+                        null, // errorId
+                        true,
+                        apiCallRc
+                    );
+                }
+                else
+                {
+                    byte[] decryptedMasterKey = encHelper.getDecryptedMasterKey(
+                        namespace,
+                        oldPassphrase.getBytes(StandardCharsets.UTF_8)
+                    );
+                    encHelper.setPassphraseImpl(
+                        newPassphrase.getBytes(StandardCharsets.UTF_8),
+                        decryptedMasterKey
+                    );
+                    ResponseUtils.reportSuccessStatic(
+                        "Crypt passphrase updated",
+                        null, // details
+                        mask | ApiConsts.MODIFIED,
+                        apiCallRc,
+                        null, // objectRefs
+                        errorReporter
+                    );
+                }
+            }
+
+        }
+        catch (InvalidKeyException invalidNameExc)
+        {
+            ResponseUtils.reportStatic(
+                new ImplementationError(
+                    "Hardcoded namespace or property key invalid",
+                    invalidNameExc
+                ),
+                "Hardcoded namespace or property key invalid",
+                ApiConsts.FAIL_IMPL_ERROR,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+        catch (InvalidValueException exc)
+        {
+            ResponseUtils.reportStatic(
+                new ImplementationError(exc),
+                "Generated key could not be stored as property",
+                ApiConsts.FAIL_IMPL_ERROR,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            ResponseUtils.reportStatic(
+                exc,
+                ResponseUtils.getSqlMsg("storing the generated and encrypted master key"),
+                ApiConsts.FAIL_SQL,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+        catch (MissingKeyPropertyException exc)
+        {
+            ResponseUtils.addAnswerStatic(
+                "Could not restore crypt passphrase as one of the following properties is not set:\n" +
+                    "'" + EncryptionHelper.KEY_CRYPT_HASH + "', '" + EncryptionHelper.KEY_CRYPT_KEY + "', '" +
+                    EncryptionHelper.KEY_PASSPHRASE_SALT + "'",
+                "This is either an implementation error or a user has manually removed one of the " +
+                    "mentioned protperties.",
+                null, // details
+                null, // correction
+                ApiConsts.MASK_MOD | ApiConsts.MASK_CTRL_CONF | ApiConsts.FAIL_MISSING_PROPS,
+                null, // objectRefs
+                null, // errorId
+                false,
+                apiCallRc
+            );
+        }
+        catch (IncorrectPassphraseException exc)
+        {
+            ResponseUtils.addAnswerStatic(
+                "Could not restore master passphrase as the given old passphrase was incorrect",
+                "Wrong passphrase", // cause
+                null, // details
+                "Enter the correct passphrase", // correction
+                ApiConsts.MASK_MOD | ApiConsts.MASK_CTRL_CONF | ApiConsts.FAIL_MISSING_PROPS,
+                null, // objectRefs
+                null, // errorId
+                true,
+                apiCallRc
+            );
+        }
+        catch (LinStorException exc)
+        {
+            ResponseUtils.reportStatic(
+                exc,
+                "An exception of type " + exc.getClass().getSimpleName() + " occurred while setting the passphrase",
+                ApiConsts.FAIL_UNKNOWN_ERROR,
+                null,
+                false,
+                apiCallRc,
+                errorReporter,
+                peerProvider.get()
+            );
+        }
+        return Flux.<ApiCallRc>just(apiCallRc)
+            .concatWith(flux);
+    }
+
+    private void setTcpPort(
+        String key,
+        String namespace,
+        String value,
+        @Nullable DynamicNumberPool poolToReloadRef,
+        ApiCallRcImpl apiCallRc,
+        PropertyChangedListener propChangedListenerRef
+    )
+        throws InvalidKeyException, InvalidValueException, DatabaseException
+    {
+        List<Range> ranges = Range.parseList(value);
+
+        if (ranges.isEmpty())
+        {
+            apiCallRc.addEntry(
+                "Value '" + value + "' did not contain a value range",
+                ApiConsts.FAIL_INVLD_TCP_PORT
+            );
+        }
+        else
+        {
+            boolean allRangesValid = true;
+            for (Range range : ranges)
+            {
+                allRangesValid &= isValidTcpPort(range.from(), apiCallRc) &&
+                    isValidTcpPort(range.to(), apiCallRc);
+            }
+            if (allRangesValid)
+            {
+                @Nullable String oldValue = systemConfRepository.setCtrlProp(key, value, namespace);
+                if (poolToReloadRef != null)
+                {
+                    poolToReloadRef.reloadRange();
+                }
+                else
+                {
+                    reloadAllNodesTcpPortPools();
+                }
+
+                if (propChangedListenerRef != null)
+                {
+                    propChangedListenerRef.changed(key, value, oldValue);
+                }
+
+                apiCallRc.addEntry(
+                    "The TCP port range was successfully updated to: " + value,
+                    ApiConsts.MODIFIED
+                );
+            }
+            else
+            {
+                throw new ApiRcException(apiCallRc);
+            }
+        }
+    }
+
+    public static boolean isValidTcpPort(int tcpPort, ApiCallRcImpl apiCallRc)
+    {
+        boolean validTcpPortNr = false;
+        try
+        {
+            TcpPortNumber.tcpPortNrCheck(tcpPort);
+            validTcpPortNr = true;
+        }
+        catch (ValueOutOfRangeException exc)
+        {
+            String errorMsg = "The given tcp port number is not valid: '" + tcpPort + "'.";
+            apiCallRc.add(
+                ApiCallRcImpl.entryBuilder(ApiConsts.FAIL_INVLD_TCP_PORT, errorMsg)
+                    .setSkipErrorReport(true)
+                    .build()
+            );
+        }
+        return validTcpPortNr;
+    }
+
+    private void setMinorNr(
+        String key,
+        String namespace,
+        String value,
+        ApiCallRcImpl apiCallRc,
+        PropertyChangedListener propChangedListenerRef
+    )
+        throws InvalidKeyException, InvalidValueException, DatabaseException
+    {
+        try
+        {
+            List<Range> ranges = Range.parseList(value);
+            if (ranges.size() != 1)
+            {
+                if (ranges.isEmpty())
+                {
+                    apiCallRc.addEntry(
+                        "Value '" + value + "' did not contain a value range",
+                        ApiConsts.FAIL_INVLD_MINOR_NR
+                    );
+                }
+                else
+                {
+                    apiCallRc.addEntry(
+                        "Currently only one range of minor numbers is supported",
+                        ApiConsts.FAIL_INVLD_MINOR_NR
+                    );
+
+                }
+            }
+            else
+            {
+                Range range = ranges.get(0);
+                if (isValidMinorNr(range.from(), apiCallRc) &&
+                    isValidMinorNr(range.to(), apiCallRc))
+                {
+                    String oldValue = systemConfRepository.setCtrlProp(key, value, namespace);
+                    minorNrPool.reloadRange();
+
+                    if (propChangedListenerRef != null)
+                    {
+                        propChangedListenerRef.changed(key, value, oldValue);
+                    }
+
+                    apiCallRc.addEntry(
+                        "The Minor range was successfully updated to: " + value,
+                        ApiConsts.MODIFIED
+                    );
+                }
+            }
+        }
+        catch (NumberFormatException nfe)
+        {
+            apiCallRc.addEntry(
+                "Value '" + value + "' is not a valid range",
+                ApiConsts.FAIL_INVLD_MINOR_NR
+            );
+        }
+    }
+
+    private boolean isValidMinorNr(int minorNr, ApiCallRcImpl apiCallRc)
+    {
+        boolean isValid = false;
+        try
+        {
+            MinorNumber.minorNrCheck(minorNr);
+            isValid = true;
+        }
+        catch (ValueOutOfRangeException exc)
+        {
+            String errorMsg = "The given minor number is not valid: '" + minorNr + "'.";
+            apiCallRc.addEntry(errorMsg, ApiConsts.FAIL_INVLD_MINOR_NR);
+            errorReporter.reportError(
+                exc,
+                null,
+                errorMsg
+            );
+        }
+        return isValid;
+    }
+
+    private boolean isAutoHttpsEnabled()
+    {
+        @Nullable String autoHttps = systemConfRepository
+            .getCtrlConfForView()
+            .getProp(ApiConsts.KEY_AUTO_HTTPS, ApiConsts.NAMESPC_REST);
+        return Boolean.parseBoolean(autoHttps);
+    }
+
+    private void restartGrizzlyHttpService()
+    {
+        SystemService svc = systemServicesMap.get(GrizzlyHttpService.INSTANCE_NAME);
+        if (svc instanceof GrizzlyHttpService grizzlyHttpService)
+        {
+            grizzlyHttpService.restart();
+        }
+    }
+}

@@ -1,0 +1,731 @@
+// workaround to force gradle to download not just the dependencies for --offline use
+// but also the plugins
+buildscript {
+    repositories {
+        maven {
+            url = "https://plugins.gradle.org/m2/"
+        }
+    }
+}
+
+plugins {
+    id("net.ltgt.errorprone") version "5.1.1" apply false
+}
+
+apply plugin: 'java'
+apply plugin: 'eclipse'
+apply plugin: 'idea'
+apply plugin: 'application'
+apply plugin: 'checkstyle'
+apply plugin: 'jacoco'
+
+checkstyleTest.enabled = false
+
+configurations {
+    compileClasspath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+    runtimeClasspath {
+        resolutionStrategy.activateDependencyLocking()
+    }
+    annotationProcessor {
+        resolutionStrategy.activateDependencyLocking()
+    }
+}
+
+def protobufVersion = '31.1'
+def protoc = file("${projectDir}/tools/protoc-" + protobufVersion + '/bin/protoc')
+def logbackConfig = "logback.xml"
+def jvmOpts = ["-Xms32M"]
+def jvmSatelliteOpts = ["-Xms32M", "-Xmx2G", "-XX:+CrashOnOutOfMemoryError"]
+def jvmControllerOpts = ["-Xms256M", "-Xmx8G", "-XX:+CrashOnOutOfMemoryError"]
+def cronVersion = '9.2.1'
+def javaHome = providers.gradleProperty("javaHome")
+
+group = 'com.linbit'
+
+allprojects {
+    plugins.withType(JavaPlugin) {
+        java {
+            sourceCompatibility = JavaVersion.VERSION_21
+        }
+    }
+    plugins.withType(CheckstylePlugin) {
+        checkstyle {
+            toolVersion = "14.1.0"
+        }
+    }
+}
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'checkstyle'
+    apply plugin: 'jacoco'
+
+    if (!rootProject.hasProperty('disableErrorProne'))
+    {
+        apply plugin: 'net.ltgt.errorprone'
+
+        dependencies {
+            errorprone("com.google.errorprone:error_prone_core:2.50.0")
+        }
+    }
+
+    // "compileJava" would exclude "compileTestJava"
+    tasks.withType(JavaCompile).configureEach {
+        options.release = 21
+        options.compilerArgs.add("-Werror")
+        if (!rootProject.hasProperty('disableErrorProne'))
+        {
+            options.errorprone {
+                disableWarningsInGeneratedCode = true
+                excludedPaths = ".*/generated-(dbdrivers|src)/.*"
+                disable("SameNameButDifferent")
+                disable("EmptyCatch")
+                disable("NonApiType")
+                disable("DoNotCallSuggester")
+                disable("MutablePublicArray")
+                disable("NullableTypeParameter")
+                disable("StringCaseLocaleUsage")
+                disable("AnnotateFormatMethod")
+                disable("DeprecatedVariable")
+            }
+        }
+    }
+
+    repositories {
+        mavenCentral()
+    }
+
+    installDist {
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    }
+}
+
+project(':server') {
+    apply plugin: 'java-library'
+    apply plugin: 'java-library-distribution'
+    // shared test utilities (server/src/testFixtures) usable by all module test source sets
+    apply plugin: 'java-test-fixtures'
+
+    dependencies {
+        api 'com.google.inject:guice:7.0.0'
+        api 'com.google.inject.extensions:guice-assistedinject:7.0.0'
+
+//      compileOnly "com.google.protobuf:protobuf-javalite:${protobufVersion}"
+        api "com.google.protobuf:protobuf-java:4.${protobufVersion}"
+
+        api 'io.sentry:sentry:8.56.0'
+        api 'info.picocli:picocli:4.7.7'
+
+        // project-reactor
+        api platform('io.projectreactor:reactor-bom:2025.0.7')
+        // add dependencies without a version number
+        api 'io.projectreactor:reactor-core'
+
+        compileOnly 'org.slf4j:slf4j-api:2.0.19'
+        api 'ch.qos.logback:logback-classic:1.6.3'
+        api 'org.apache.httpcomponents.client5:httpclient5:5.6.4'
+        api 'com.fasterxml.jackson.jr:jackson-jr-objects:2.22.2'
+        api 'com.fasterxml.jackson.core:jackson-databind:2.22.2'
+
+        api 'org.apache.commons:commons-dbcp2:2.14.0'
+        api 'org.apache.commons:commons-pool2:2.13.1'
+        api 'com.h2database:h2:2.4.240'
+
+        // prometheus client
+        api 'io.prometheus:simpleclient_common:0.16.0'
+
+        api platform('com.amazonaws:aws-java-sdk-bom:1.12.797') // switching to awssdk 2.x needs some more work
+        api 'com.amazonaws:aws-java-sdk-s3'
+        api 'com.amazonaws:aws-java-sdk-ebs'
+        api 'com.amazonaws:aws-java-sdk-ec2'
+
+        api "com.cronutils:cron-utils:${cronVersion}"
+
+        // toml parsing library
+        api 'io.hotmoka:toml4j:0.7.3'
+
+        // LINSTOR only uses the k8s client as a CRD-based database backend. The
+        // kubernetes-client(-api) pulls in a model module per k8s API group, but we only
+        // need the base types (model-core/-common) and CustomResourceDefinitions
+        // (model-apiextensions). We must additionally keep the model modules whose classes
+        // the fabric8 client loads regardless of which resource we operate on:
+        //  - eagerly, while building the KubernetesClient: KubernetesClientImpl
+        //    .registerDefaultHandlers() hard-references handler classes from apps
+        //    (Deployment/ReplicaSet/StatefulSet), batch (Job), certificates
+        //    (CertificateSigningRequest) and extensions (Deployment/ReplicaSet);
+        //  - reflectively, on any CRUD operation: BaseOperation/OperationSupport build
+        //    anonymous Jackson TypeReferences, so generic-signature reification calls
+        //    Class.getDeclaredMethods() on those classes and force-loads the model types
+        //    in their method descriptors, namely autoscaling (Scale) and extensions
+        //    (DeploymentRollback).
+        // Excluding any of those breaks startup/operations with a ClassNotFoundException.
+        // The remaining model modules are only reachable from typed DSL accessors
+        // (client.network()/.rbac()/.policy()/...) that LINSTOR never calls, so exclude
+        // the model modules for those API groups.
+        api('io.fabric8:kubernetes-client:7.9.0') {
+            [
+                'admissionregistration', 'coordination', 'discovery', 'events',
+                'flowcontrol', 'gatewayapi', 'metrics', 'networking', 'node', 'policy',
+                'rbac', 'resource', 'scheduling', 'storageclass'
+            ].each { apiGroup ->
+                exclude group: 'io.fabric8', module: "kubernetes-model-$apiGroup"
+            }
+        }
+
+        api 'com.github.spotbugs:spotbugs-annotations:4.10.4'
+
+        api 'info.faljse:SDNotify:1.6'
+
+        testImplementation(platform('org.junit:junit-bom:6.1.3'))
+
+        testFixturesImplementation 'junit:junit:4.13.2'
+    }
+
+    sourceSets {
+        main {
+            java {
+                srcDirs = ["src/main/java", "generated-dbdrivers", "generated-src"]
+            }
+            resources {
+                srcDirs = ["src/main/resources", "generated-resources"]
+            }
+        }
+        test {
+            java {
+                srcDirs = ["src/test/java"]
+            }
+        }
+    }
+
+    /////////////////////////// Version Info ///////////////////////////
+    tasks.register('versionInfo') {
+        String propsFile = "$projectDir/generated-resources/version-info.properties"
+        outputs.file(propsFile)
+
+        if (project.hasProperty('versionOverride')) {
+            logger.warn("Overriding version with $versionOverride")
+            version = versionOverride
+        }
+
+        if (!project.hasProperty('versionOverride')) {
+            File gitFolder = file("$projectDir/../.git")
+            if (gitFolder.exists()) {
+                try {
+                    // providers.exec captures stdout/stderr instead of printing it
+                    providers.exec {
+                        workingDir projectDir
+                        commandLine 'make', '-C', '..', 'versioninfo'
+                    }.result.get()
+                } catch (Exception exc) {
+                    throw new RuntimeException("Cannot generate version.", exc)
+                }
+            }
+
+            Properties props = new Properties()
+            try {
+                props.load(new FileInputStream(propsFile))
+            } catch (Exception exc) {
+                throw new RuntimeException("Cannot read version.", exc)
+            }
+            version = props.get("version")
+        }
+    }
+
+    /**
+     * Generates Java sources from common API definitions. This includes the protobuf compilation.
+     *
+     * For package builds this task is run in the 'make debrelease' stage, the generated sources are bundled in the package
+     * tarball, and it is then skipped when the package is finally built.
+     */
+    tasks.register('generateProto', Exec) {
+        doFirst {
+            if (!protoc.exists()) {
+                throw new GradleException("'protoc' binary not found; run the task 'getProtoc' to download the binary")
+            }
+        }
+
+        commandLine 'make', '-C', "${projectDir}/proto", "PROTOC=" + protoc, 'proto'
+
+        inputs.files(fileTree("${projectDir}/proto"))
+        outputs.dir(file("${projectDir}/generated-src"))
+    }
+
+    tasks.register('generateJava', Exec) {
+        commandLine 'make', '-C', '../linstor-common', 'java'
+
+        inputs.files(fileTree("../linstor-common"))
+        outputs.files(file("${projectDir}/generated-src/com/linbit/linstor/api/ApiConsts.java"),
+                "${projectDir}/generated-src/com/linbit/linstor/api/prop/GeneratedPropertyRules.java"
+        )
+        dependsOn generateProto
+    }
+
+    tasks.register('cleanProto', Exec) {
+        commandLine 'make', '-C', "${projectDir}/proto", 'clean-proto'
+    }
+
+    tasks.register('cleanCommon', Exec) {
+        commandLine 'make', '-C', "../linstor-common", 'cleanjava'
+    }
+
+    processResources.dependsOn versionInfo
+
+    compileJava {
+        dependsOn generateJava
+    }
+
+    clean {
+        delete "${projectDir}/generated-resources"
+        dependsOn cleanCommon, cleanProto
+    }
+}
+
+project(':satellite') {
+    apply plugin: 'application'
+
+    dependencies {
+        implementation project(':server'), project(':jclcrypto')
+
+        testImplementation testFixtures(project(':server'))
+        testImplementation 'junit:junit:4.13.2'
+        testImplementation "org.assertj:assertj-core:3.27.+"
+        testImplementation "org.mockito:mockito-core:5.23.0"
+    }
+
+    sourceSets {
+        main {
+            java {
+                srcDirs = ["src/main/java"]
+            }
+            resources {
+                srcDirs = ["src/main/resources"]
+            }
+        }
+        test {
+            java {
+                srcDirs = ["src/test/java"]
+            }
+        }
+    }
+
+    startScripts.enabled = false
+    tasks.register('SatelliteStartup', CreateStartScripts) {
+        mainClass = 'com.linbit.linstor.core.Satellite'
+        applicationName = "Satellite"
+        outputDir = layout.buildDirectory.dir('satellite').get().asFile
+        classpath = files('conf') + files('*')
+        defaultJvmOpts = jvmSatelliteOpts
+        doLast {
+            delete windowsScript
+            if (javaHome.present) {
+                unixScript.text = unixScript.text.replaceFirst("JAVACMD=\"?java\"?", "JAVACMD=${javaHome.get()}/bin/java")
+            }
+        }
+    }
+
+    distributions {
+        main {
+            contents {
+                from(SatelliteStartup) {
+                    into("bin")
+                }
+            }
+        }
+    }
+}
+
+project(':jclcrypto') {
+    apply plugin: 'java-library'
+    apply plugin: 'java-library-distribution'
+
+    dependencies {
+        implementation project(':server')
+    }
+
+    sourceSets {
+        main {
+            java {
+                srcDirs = ["src/main/java", "generated-src"]
+            }
+        }
+        test {
+            java {
+                srcDirs = ["src/test/java"]
+            }
+        }
+    }
+}
+
+version = project(':server').version
+project(':controller').version = version
+project(':satellite').version = version
+project(':jclcrypto').version = version
+
+def jerseyVersion = '4.0.2'
+
+project(':controller') {
+    apply plugin: 'application'
+
+    configurations {
+        // H2 1.x jar shipped outside the classpath (lib/migration), only used by
+        // "linstor-database migrate-h2" to read pre-2.x database files
+        h2v1migration {
+            transitive = false
+            canBeConsumed = false
+        }
+    }
+
+    dependencies {
+        implementation project(':server'), project(':jclcrypto')
+        testImplementation project(':server'), project(':jclcrypto')
+        testImplementation testFixtures(project(':server'))
+
+        testImplementation 'junit:junit:4.13.2'
+        testImplementation "org.assertj:assertj-core:3.27.+"
+        testImplementation "org.mockito:mockito-core:5.23.0"
+
+        h2v1migration 'com.h2database:h2:1.4.197'
+
+        // rest libs (grizzly http(s), jersey(rest))
+        implementation 'org.glassfish.grizzly:grizzly-http-server:5.0.2'
+        // jersey 4.0.2 is built against the hk2 4.0.0-M3 milestone; align all hk2 artifacts with guice-bridge
+        implementation 'org.glassfish.hk2:guice-bridge:4.0.2'
+        implementation 'org.glassfish.hk2:hk2-api:4.0.2'
+        implementation 'org.glassfish.hk2:hk2-locator:4.0.2'
+        implementation 'org.glassfish.hk2:hk2-utils:4.0.2'
+        implementation "org.glassfish.jersey.inject:jersey-hk2:${jerseyVersion}"
+        implementation "org.glassfish.jersey.containers:jersey-container-grizzly2-http:${jerseyVersion}"
+        implementation "org.glassfish.jersey.containers:jersey-container-grizzly2-servlet:${jerseyVersion}"
+        implementation "org.glassfish.jersey.media:jersey-media-sse:${jerseyVersion}"
+
+        // prometheus client library
+        implementation 'io.prometheus:simpleclient_hotspot:0.16.0'
+
+        runtimeOnly 'org.mariadb.jdbc:mariadb-java-client:3.5.10'
+        runtimeOnly 'org.postgresql:postgresql:42.7.13'
+    }
+
+    sourceSets {
+        main {
+            java {
+                srcDirs = ["src/main/java", "generated-src"]
+            }
+            resources {
+                srcDirs = ["src/main/resources", "generated-resources"]
+            }
+        }
+        test {
+            java {
+                srcDirs = ["src/test/java"]
+            }
+        }
+    }
+
+    startScripts.enabled = false
+    tasks.register('ControllerStartup', CreateStartScripts) {
+        mainClass = 'com.linbit.linstor.core.Controller'
+        applicationName = "Controller"
+        outputDir = layout.buildDirectory.dir('controller').get().asFile
+        classpath = files('conf') + files('*')
+        defaultJvmOpts = jvmControllerOpts
+        doLast {
+            delete windowsScript
+            if (javaHome.present) {
+                unixScript.text = unixScript.text.replaceFirst("JAVACMD=\"?java\"?", "JAVACMD=${javaHome.get()}/bin/java")
+            }
+        }
+    }
+
+    tasks.register('LinstorConfigStartup', CreateStartScripts) {
+        mainClass = 'com.linbit.linstor.core.LinstorConfigTool'
+        applicationName = "linstor-config"
+        outputDir = layout.buildDirectory.dir('linstorconfig').get().asFile
+        classpath = files('*')
+        defaultJvmOpts = jvmOpts
+        doLast {
+            delete windowsScript
+            if (javaHome.present) {
+                unixScript.text = unixScript.text.replaceFirst("JAVACMD=\"?java\"?", "JAVACMD=${javaHome.get()}/bin/java")
+            }
+        }
+    }
+
+    tasks.register('LinstorDbToolStartup', CreateStartScripts) {
+        mainClass = 'com.linbit.linstor.core.LinstorDatabaseTool'
+        applicationName = "linstor-database"
+        outputDir = layout.buildDirectory.dir('linstordb').get().asFile
+        classpath = files('*')
+        defaultJvmOpts = jvmOpts
+        doLast {
+            delete windowsScript
+            if (javaHome.present) {
+                unixScript.text = unixScript.text.replaceFirst("JAVACMD=\"?java\"?", "JAVACMD=${javaHome.get()}/bin/java")
+            }
+        }
+    }
+
+    distributions {
+        main {
+            contents {
+                from(ControllerStartup) {
+                    into("bin")
+                }
+                from(LinstorConfigStartup) {
+                    into("bin")
+                }
+                from(LinstorDbToolStartup) {
+                    into("bin")
+                }
+                from(configurations.h2v1migration) {
+                    into("lib/migration")
+                }
+            }
+        }
+    }
+}
+
+sourceSets {
+    test {
+        java {
+            srcDirs = ["src/test/java"]
+        }
+    }
+}
+
+test {
+    jvmArgs("--add-opens", "java.base/java.lang=ALL-UNNAMED",
+            "--add-opens", "java.base/java.util=ALL-UNNAMED",
+            "--add-opens", "java.base/java.io=ALL-UNNAMED",)
+    // gradle's 512M default is too small for the H2/Guice based API test suites + jacoco instrumentation
+    maxHeapSize = '2g'
+    finalizedBy jacocoTestReport // report is always generated after tests run
+}
+
+jacocoTestReport {
+    if (project.hasProperty('CoverageReport')) {
+        dependsOn = subprojects.test
+        additionalSourceDirs.setFrom(files(subprojects.sourceSets.main.allSource.srcDirs))
+        sourceDirectories.setFrom(files(subprojects.sourceSets.main.allSource.srcDirs))
+        classDirectories.setFrom(files(subprojects.sourceSets.main.output))
+        // include the execution data of the per-module test tasks (satellite, controller)
+        executionData.setFrom(
+            files(
+                layout.buildDirectory.file("jacoco/test.exec"),
+                subprojects.collect { it.layout.buildDirectory.file("jacoco/test.exec") }
+            ).filter { it.exists() }
+        )
+        reports {
+            html.required = true
+            xml.required = true
+            csv.required = true
+        }
+        onlyIf = {
+            true
+        }
+//        doFirst {
+//            executionData.setFrom(files(executionData.findAll {
+//                it.exists()
+//            }))
+//        }
+        afterEvaluate {
+            excludedClassFilesForReport(classDirectories)
+        }
+    }
+}
+
+jacocoTestCoverageVerification {
+    if (project.hasProperty('CoverageReport')) {
+        afterEvaluate {
+            excludedClassFilesForReport(classDirectories)
+        }
+    }
+}
+
+private excludedClassFilesForReport(classDirectories) {
+    classDirectories.setFrom(files(classDirectories.files.collect {
+        fileTree(dir: it,
+                exclude: [
+                        // generated code only: keep the coverage denominator to handwritten classes
+                        'com/linbit/linstor/proto/**',
+                        'com/linbit/linstor/dbdrivers/k8s/crd/GenCrdCurrent*',
+                        'com/linbit/linstor/dbdrivers/k8s/crd/GenCrdV*',
+                        'com/linbit/linstor/dbdrivers/GeneratedDatabaseTables*',
+                        'com/linbit/linstor/api/prop/GeneratedPropertyRules*',
+                        'com/linbit/linstor/api/ApiConsts*'
+                ]
+        )
+    }))
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':server'), project(':controller'), project(':satellite'), project(':jclcrypto')
+    testImplementation project(':server'), project(':controller'), project(':satellite'), project(':jclcrypto')
+    testImplementation testFixtures(project(':server'))
+
+    testImplementation "com.google.protobuf:protobuf-java:4.${protobufVersion}"
+
+    testImplementation 'org.mockito:mockito-core:5.23.0'
+
+    testCompileOnly 'org.slf4j:slf4j-api:2.0.19'
+    testImplementation 'org.assertj:assertj-core:3.27.+'
+    testImplementation 'pl.pragmatists:JUnitParams:1.1.1'
+
+    testImplementation "com.cronutils:cron-utils:${cronVersion}"
+
+    testImplementation 'com.google.inject.extensions:guice-testlib:7.0.0'
+    testImplementation 'io.projectreactor:reactor-test:3.8.+'
+}
+
+/////////////////////////// Start scripts ///////////////////////////
+startScripts.enabled = false
+
+distributions {
+    main {
+        contents {
+            from(project(":controller").ControllerStartup) {
+                into("bin")
+            }
+            from(project(":satellite").SatelliteStartup) {
+                into("bin")
+            }
+            from(project(":controller").LinstorConfigStartup) {
+                into("bin")
+            }
+            from(project(":controller").LinstorDbToolStartup) {
+                into("bin")
+            }
+            from("server/" + logbackConfig) {
+                into("lib/conf")
+            }
+            from("scripts/linstor-controller.service") {
+                into("systemd")
+            }
+            from("scripts/linstor-satellite.service") {
+                into("systemd")
+            }
+            from("scripts/linstor-controller-ha-setup.py") {
+                into("bin")
+                rename { "linstor-controller-ha-setup" }
+            }
+            from(project(":controller").configurations.h2v1migration) {
+                into("lib/migration")
+            }
+        }
+    }
+}
+
+installDist {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register('showMeCache') {
+    doLast {
+        configurations.runtimeClasspath.each { println it }
+    }
+}
+
+tasks.register('showMeTestCache') {
+    doLast {
+        configurations.testRuntimeClasspath.each { println it }
+    }
+}
+
+/////////////////////////// Test commands ///////////////////////////
+tasks.register('buildTestCommands', Exec) {
+    workingDir 'test-support'
+
+    commandLine 'make'
+
+    //store the output instead of printing to the console:
+    standardOutput = new ByteArrayOutputStream()
+
+    //extension method buildTestCommands.output() can be used to obtain the output:
+    ext.output = {
+        return standardOutput.toString()
+    }
+}
+
+tasks.register('unzipProtoc', Copy) {
+    dependsOn(downloadProtoc)
+
+    def zipFile = file("tools/protoc-" + protobufVersion + '-linux-x86_64.zip')
+    def outputDir = file("tools/protoc-" + protobufVersion)
+
+    from zipTree(zipFile)
+    into outputDir
+    eachFile {
+        if (it.relativePath.getFile(destinationDir).exists()) {
+            it.exclude()
+        }
+    }
+}
+
+tasks.register('downloadProtoc') {
+    outputs.dir "tools"
+    def protozip = new File("${projectDir}/tools/protoc-" + protobufVersion + '-linux-x86_64.zip')
+    outputs.file protozip
+
+    doLast {
+        if (!protozip.exists()) {
+            mkdir "tools"
+            println "downloading protoc..."
+            new URL('https://github.com/google/protobuf/releases/download/v'
+                    + protobufVersion + '/protoc-' + protobufVersion + '-linux-x86_64.zip')
+                    .withInputStream { i -> protozip.withOutputStream { it << i } }
+        }
+    }
+}
+
+tasks.register('getProtoc') {
+    dependsOn downloadProtoc, unzipProtoc
+}
+
+tasks.register('cleanTestCommands', Exec) {
+    workingDir 'test-support'
+
+    commandLine 'make', 'clean'
+
+    //store the output instead of printing to the console:
+    standardOutput = new ByteArrayOutputStream()
+
+    //extension method buildTestCommands.output() can be used to obtain the output:
+    ext.output = {
+        return standardOutput.toString()
+    }
+}
+
+compileTestJava {
+  dependsOn buildTestCommands
+}
+
+clean {
+    dependsOn cleanTestCommands
+}
+
+// this task is needed for RPM packaging
+// it creates a list of dependency jars needed for the server project
+tasks.register('showServerRuntimeLibs') {
+    doLast {
+        project(':server').configurations.getByName('runtimeClasspath').files.each { f ->
+            print('/usr/share/linstor-server/lib/' + f.getName().toString() + '\n')
+        }
+    }
+}
+
+tasks.register('downloadDependencies') {
+    doLast {
+        subprojects.each { prj ->
+            ['compileClasspath', 'runtimeClasspath'].each { scope ->
+                prj.configurations.getByName(scope).resolve()
+            }
+        }
+        // needed by --offline package builds for "linstor-database migrate-h2"
+        project(':controller').configurations.getByName('h2v1migration').resolve()
+    }
+}

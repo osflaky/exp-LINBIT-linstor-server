@@ -1,0 +1,29 @@
+extends: "@ibm-cloud/openapi-ruleset"
+rules:
+  # --- Rules turned off (not applicable to LINSTOR API) ---
+
+  # LINSTOR uses lower-dash-case paths, not snake_case
+  ibm-path-segment-casing-convention: off
+
+  # Array responses are used extensively in the LINSTOR API
+  ibm-no-array-responses: off
+
+  # Not all response models define properties (e.g. info endpoints)
+  ibm-accept-and-return-models: off
+
+  # LINSTOR uses consecutive path params (e.g. /node-connections/{node_a}/{node_b})
+  ibm-no-consecutive-path-parameter-segments: off
+
+  # Integer min/max attributes not enforced
+  ibm-integer-attributes: off
+
+  # New v1.x rules not present in old validator
+  ibm-required-array-properties-in-response: off
+  ibm-required-enum-properties-in-response: off
+
+  # --- Rules set to warn (were warning in old .validaterc) ---
+  ibm-requestbody-is-object: warn
+  ibm-enum-casing-convention: warn
+  ibm-parameter-casing-convention: warn
+  ibm-unique-parameter-request-property-names: warn
+  ibm-operation-summary-length: warn

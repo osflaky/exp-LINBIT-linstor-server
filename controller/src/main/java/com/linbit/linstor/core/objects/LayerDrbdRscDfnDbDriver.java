@@ -1,0 +1,240 @@
+package com.linbit.linstor.core.objects;
+
+import com.linbit.InvalidNameException;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.SnapshotName;
+import com.linbit.linstor.core.identifier.VolumeNumber;
+import com.linbit.linstor.core.objects.AbsLayerRscDataDbDriver.ParentObjects;
+import com.linbit.linstor.core.objects.AbsLayerRscDataDbDriver.SuffixedResourceName;
+import com.linbit.linstor.core.types.TcpPortNumber;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.dbdrivers.DbEngine;
+import com.linbit.linstor.dbdrivers.GeneratedDatabaseTables;
+import com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.LayerDrbdResourceDefinitions;
+import com.linbit.linstor.dbdrivers.RawParameters;
+import com.linbit.linstor.dbdrivers.interfaces.LayerDrbdRscDfnDatabaseDriver;
+import com.linbit.linstor.dbdrivers.interfaces.updater.SingleColumnDatabaseDriver;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscData;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscDfnData;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdVlmDfnData;
+import com.linbit.linstor.storage.interfaces.layers.drbd.DrbdRscDfnObject.TransportType;
+import com.linbit.linstor.transaction.TransactionObjectFactory;
+import com.linbit.linstor.transaction.manager.TransactionMgrSQL;
+import com.linbit.utils.Pair;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.TreeMap;
+import java.util.function.Function;
+
+@Singleton
+public class LayerDrbdRscDfnDbDriver
+    extends AbsLayerRscDfnDataDbDriver<DrbdRscDfnData<?>, DrbdRscData<?>>
+    implements LayerDrbdRscDfnDatabaseDriver
+{
+    private final TransactionObjectFactory transObjFactory;
+    private final Provider<TransactionMgrSQL> transMgrProvider;
+
+    private final SingleColumnDatabaseDriver<DrbdRscDfnData<?>, TcpPortNumber> tcpPortDriver;
+    private final SingleColumnDatabaseDriver<DrbdRscDfnData<?>, TransportType> transportTypeDriver;
+    private final SingleColumnDatabaseDriver<DrbdRscDfnData<?>, String> secretDriver;
+    private final SingleColumnDatabaseDriver<DrbdRscDfnData<?>, Short> peerSlotsDriver;
+
+    @Inject
+    public LayerDrbdRscDfnDbDriver(
+        ErrorReporter errorReporterRef,
+        DbEngine dbEngineRef,
+        TransactionObjectFactory transObjFactoryRef,
+        Provider<TransactionMgrSQL> transMgrProviderRef
+    )
+    {
+        super(
+            errorReporterRef,
+            GeneratedDatabaseTables.LAYER_DRBD_RESOURCE_DEFINITIONS,
+            dbEngineRef
+        );
+        transObjFactory = transObjFactoryRef;
+        transMgrProvider = transMgrProviderRef;
+
+        setColumnSetter(
+            LayerDrbdResourceDefinitions.RESOURCE_NAME,
+            drbdRscDfnData -> drbdRscDfnData.getResourceName().value
+        );
+        setColumnSetter(LayerDrbdResourceDefinitions.RESOURCE_NAME_SUFFIX, DrbdRscDfnData::getRscNameSuffix);
+        setColumnSetter(
+            LayerDrbdResourceDefinitions.SNAPSHOT_NAME,
+            drbdRscDfnData ->
+            {
+                String ret;
+                SnapshotName snapName = drbdRscDfnData.getSnapshotName();
+                if (snapName != null)
+                {
+                    ret = snapName.value;
+                }
+                else
+                {
+                    ret = ResourceDefinitionDbDriver.DFLT_SNAP_NAME_FOR_RSC;
+                }
+                return ret;
+            }
+        );
+        /* we are saving on DB level as INTEGER instead of SMALLINT */
+        setColumnSetter(
+            LayerDrbdResourceDefinitions.PEER_SLOTS,
+            drbdRscDfnData -> (int) drbdRscDfnData.getPeerSlots()
+        );
+        setColumnSetter(LayerDrbdResourceDefinitions.AL_STRIPES, DrbdRscDfnData::getAlStripes);
+        setColumnSetter(LayerDrbdResourceDefinitions.AL_STRIPE_SIZE, DrbdRscDfnData::getAlStripeSize);
+        setColumnSetter(LayerDrbdResourceDefinitions.TCP_PORT, this::getTcpPort);
+        setColumnSetter(
+            LayerDrbdResourceDefinitions.TRANSPORT_TYPE,
+            drbdRscDfnData -> drbdRscDfnData.getTransportType().name()
+        );
+        setColumnSetter(LayerDrbdResourceDefinitions.SECRET, DrbdRscDfnData::getSecret);
+
+        tcpPortDriver = generateSingleColumnDriver(
+            LayerDrbdResourceDefinitions.TCP_PORT,
+            drbdRscDfnData -> "" + getTcpPort(drbdRscDfnData),
+            tcpPort -> tcpPort == null ? null : tcpPort.value
+        );
+        transportTypeDriver = generateSingleColumnDriver(
+            LayerDrbdResourceDefinitions.TRANSPORT_TYPE,
+            drbdRscDfnData -> drbdRscDfnData.getTransportType().name(),
+            TransportType::name
+        );
+        secretDriver = generateSingleColumnDriver(
+            LayerDrbdResourceDefinitions.SECRET,
+            DrbdRscDfnData::getSecret,
+            Function.identity()
+        );
+        /* we are saving on DB level as INTEGER instead of SMALLINT */
+        peerSlotsDriver = generateSingleColumnDriver(
+            LayerDrbdResourceDefinitions.PEER_SLOTS,
+            drbdRscDfnData -> "" + drbdRscDfnData.getPeerSlots(),
+            Short::intValue
+        );
+    }
+
+    private @Nullable Integer getTcpPort(DrbdRscDfnData<?> drbdRscDfnData)
+    {
+        Integer ret = null;
+        TcpPortNumber tcpPort = drbdRscDfnData.getTcpPort();
+        if (tcpPort != null)
+        {
+            ret = tcpPort.value;
+        }
+        return ret;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<DrbdRscDfnData<?>, TcpPortNumber> getTcpPortDriver()
+    {
+        return tcpPortDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<DrbdRscDfnData<?>, TransportType> getTransportTypeDriver()
+    {
+        return transportTypeDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<DrbdRscDfnData<?>, String> getRscDfnSecretDriver()
+    {
+        return secretDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<DrbdRscDfnData<?>, Short> getPeerSlotsDriver()
+    {
+        return peerSlotsDriver;
+    }
+
+    @Override
+    protected Pair<DrbdRscDfnData<?>, List<DrbdRscData<?>>> load(RawParameters raw, ParentObjects parentRef)
+        throws DatabaseException, InvalidNameException, ValueOutOfRangeException
+    {
+        ResourceName rscName = raw.build(LayerDrbdResourceDefinitions.RESOURCE_NAME, ResourceName::new);
+        String rscNameSuffix = raw.get(LayerDrbdResourceDefinitions.RESOURCE_NAME_SUFFIX);
+        String snapNameStr = raw.get(LayerDrbdResourceDefinitions.SNAPSHOT_NAME);
+
+        short peerSlots;
+        @Nullable Integer alStripes = raw.get(LayerDrbdResourceDefinitions.AL_STRIPES);
+        @Nullable Long alStripesSize = raw.get(LayerDrbdResourceDefinitions.AL_STRIPE_SIZE);
+        @Nullable Integer port = raw.get(LayerDrbdResourceDefinitions.TCP_PORT);
+        TransportType transportType = raw.<String, TransportType, IllegalArgumentException>build(
+            LayerDrbdResourceDefinitions.TRANSPORT_TYPE,
+            TransportType::byValue
+        );
+        String secret = raw.get(LayerDrbdResourceDefinitions.SECRET);
+
+        // bug: by accident we store the peerSlots as INTEGER instead of SMALLINT
+        peerSlots = raw.<Integer>get(LayerDrbdResourceDefinitions.PEER_SLOTS).shortValue();
+
+        SuffixedResourceName suffixedRscName;
+
+        if (snapNameStr == null || snapNameStr.equals(ResourceDefinitionDbDriver.DFLT_SNAP_NAME_FOR_RSC))
+        {
+            suffixedRscName = new SuffixedResourceName(rscName, null, rscNameSuffix);
+        }
+        else
+        {
+            suffixedRscName = new SuffixedResourceName(rscName, new SnapshotName(snapNameStr), rscNameSuffix);
+            secret = null; // just to be sure
+        }
+
+        return genericCreate(
+            suffixedRscName,
+            peerSlots,
+            alStripes,
+            alStripesSize,
+            port,
+            transportType,
+            secret
+        );
+    }
+
+    @SuppressWarnings("unchecked")
+    private <RSC extends AbsResource<RSC>> Pair<DrbdRscDfnData<?>, List<DrbdRscData<?>>> genericCreate(
+        SuffixedResourceName suffixedRscNameRef,
+        short peerSlotsRef,
+        @Nullable Integer alStripesRef,
+        @Nullable Long alStripesSizeRef,
+        @Nullable Integer portRef,
+        TransportType transportTypeRef,
+        @Nullable String secretRef
+    )
+        throws ValueOutOfRangeException
+    {
+        TreeMap<VolumeNumber, DrbdVlmDfnData<RSC>> drbdVlmDfnDataMap = new TreeMap<>();
+        List<DrbdRscData<RSC>> rscDataList = new ArrayList<>();
+
+        DrbdRscDfnData<RSC> drbdRscDfnData = new DrbdRscDfnData<>(
+            suffixedRscNameRef.rscName,
+            suffixedRscNameRef.snapName,
+            suffixedRscNameRef.rscNameSuffix,
+            peerSlotsRef,
+            alStripesRef,
+            alStripesSizeRef,
+            portRef,
+            transportTypeRef,
+            secretRef,
+            rscDataList,
+            drbdVlmDfnDataMap,
+            this,
+            transObjFactory,
+            transMgrProvider
+        );
+        return new Pair<>(
+            drbdRscDfnData,
+            (List<DrbdRscData<?>>) ((Object) rscDataList)
+        );
+    }
+}

@@ -1,0 +1,1356 @@
+package com.linbit.linstor.core.apicallhandler.controller.backup;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.ApiModule;
+import com.linbit.linstor.backupshipping.BackupShippingUtils;
+import com.linbit.linstor.core.BackupInfoManager;
+import com.linbit.linstor.core.BackupInfoManager.QueueItem;
+import com.linbit.linstor.core.CtrlSecurityObjects;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlApiDataLoader;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlSnapshotCrtApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlSnapshotCrtHelper;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlTransactionHelper;
+import com.linbit.linstor.core.apicallhandler.controller.backup.CtrlBackupApiHelper.S3ObjectInfo;
+import com.linbit.linstor.core.apicallhandler.controller.backup.l2l.rest.data.BackupShippingSrcData;
+import com.linbit.linstor.core.apicallhandler.controller.backup.nodefinder.BackupNodeFinder;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.controller.req.CreateMultiSnapRequest;
+import com.linbit.linstor.core.apicallhandler.response.ApiDatabaseException;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.identifier.RemoteName;
+import com.linbit.linstor.core.identifier.SnapshotName;
+import com.linbit.linstor.core.objects.AbsResource;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.SnapshotDefinition;
+import com.linbit.linstor.core.objects.SnapshotVolumeDefinition;
+import com.linbit.linstor.core.objects.remotes.AbsRemote;
+import com.linbit.linstor.core.objects.remotes.AbsRemote.RemoteType;
+import com.linbit.linstor.core.objects.remotes.LinstorRemote;
+import com.linbit.linstor.core.objects.remotes.S3Remote;
+import com.linbit.linstor.core.repository.SystemConfRepositoryImpl;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.propscon.InvalidValueException;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.propscon.ReadOnlyProps;
+import com.linbit.linstor.storage.data.RscLayerSuffixes;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscData;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscDfnData;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.kinds.ExtTools;
+import com.linbit.linstor.storage.kinds.ExtToolsInfo;
+import com.linbit.linstor.storage.kinds.ExtToolsInfo.Version;
+import com.linbit.linstor.utils.externaltools.ExtToolsManager;
+import com.linbit.linstor.utils.layer.LayerRscUtils;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.utils.StringUtils;
+import com.linbit.utils.TimeUtils;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeMap;
+
+import reactor.core.publisher.Flux;
+import reactor.util.context.Context;
+
+@Singleton
+public class CtrlBackupCreateApiCallHandler
+{
+    private final ScopeRunner scopeRunner;
+    private final LockGuardFactory lockGuardFactory;
+    private final CtrlSecurityObjects ctrlSecObj;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final CtrlSnapshotCrtHelper snapCrtHelper;
+    private final SystemConfRepositoryImpl sysCfgRepo;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlSnapshotCrtApiCallHandler snapshotCrtHandler;
+    private final ErrorReporter errorReporter;
+    private final BackupInfoManager backupInfoMgr;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final CtrlBackupApiHelper backupHelper;
+    private final BackupNodeFinder backupNodeFinder;
+
+    @Inject
+    public CtrlBackupCreateApiCallHandler(
+        ScopeRunner scopeRunnerRef,
+        LockGuardFactory lockGuardFactoryRef,
+        CtrlSecurityObjects ctrlSecObjRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        CtrlSnapshotCrtHelper snapCrtHelperRef,
+        SystemConfRepositoryImpl sysCfgRepoRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlSnapshotCrtApiCallHandler snapshotCrtHandlerRef,
+        ErrorReporter errorReporterRef,
+        BackupInfoManager backupInfoMgrRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        CtrlBackupApiHelper backupHelperRef,
+        BackupNodeFinder backupNodeFinderRef
+    )
+    {
+        scopeRunner = scopeRunnerRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        ctrlSecObj = ctrlSecObjRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        snapCrtHelper = snapCrtHelperRef;
+        sysCfgRepo = sysCfgRepoRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        snapshotCrtHandler = snapshotCrtHandlerRef;
+        errorReporter = errorReporterRef;
+        backupInfoMgr = backupInfoMgrRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        backupHelper = backupHelperRef;
+        backupNodeFinder = backupNodeFinderRef;
+    }
+
+    public Flux<ApiCallRc> createBackup(
+        String rscNameRef,
+        @Nullable String snapNameRef,
+        String remoteNameRef,
+        @Nullable String nodeNameRef,
+        @Nullable String scheduleNameRef,
+        boolean incremental,
+        boolean runInBackgroundRef
+    )
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Prepare backup",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> backupSnapshot(
+                rscNameRef,
+                remoteNameRef,
+                nodeNameRef,
+                snapNameRef,
+                LocalDateTime.now(ZoneId.systemDefault()),
+                incremental,
+                RemoteType.S3,
+                scheduleNameRef,
+                runInBackgroundRef,
+                null,
+                null,
+                false
+            ).getFlux()
+        );
+    }
+
+    /**
+     * Starts a backup shipping.<br/>
+     * More detailed order of things:
+     * <ul>
+     * <li>Generates a snapName if needed</li>
+     * <li>Checks encryption</li>
+     * <li>Makes sure no other shipping of this rsc is currently running</li>
+     * <li>Makes sure an incremental backup is made if allowed</li>
+     * <li>Chooses a node</li>
+     * <li>Creates the snapshot on all nodes</li>
+     * <li>Makes sure metadata is handled the same over all volumes</li>
+     * <li>Saves the drbd-node-ids since they will be needed for a restore</li>
+     * <li>Sets all flags and props needed for the stlt to start the shipping</li>
+     * </ul>
+     *
+     */
+    BackupSnapshotObj backupSnapshot(
+        String rscNameRef,
+        String remoteName,
+        @Nullable String nodeName,
+        @Nullable String snapNameRef,
+        LocalDateTime nowRef,
+        boolean allowIncremental,
+        RemoteType remoteTypeRef,
+        @Nullable String scheduleNameRef,
+        boolean runInBackgroundRef,
+        @Nullable String prevSnapDfnUuid,
+        @Nullable BackupShippingSrcData l2lData,
+        boolean copySnapsForEvac
+    )
+    {
+        String snapName = snapNameRef;
+
+        try
+        {
+            ApiCallRcImpl responses = new ApiCallRcImpl();
+
+            if (snapName == null || snapName.isEmpty())
+            {
+                snapName = BackupShippingUtils.generateBackupName(nowRef);
+                responses.addEntry(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.MASK_INFO,
+                        "Generated snapshot name for backup of resource" + rscNameRef + " to remote " + remoteName
+                    )
+                );
+            }
+            ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscNameRef);
+            AbsRemote remote;
+            @Nullable SnapshotDefinition prevSnapDfn = null;
+            @Nullable SnapshotDefinition snapDfn = rscDfn.getSnapshotDfn(new SnapshotName(snapName));
+
+            if (
+                snapDfn != null && (snapDfn.getFlags()
+                    .isSomeSet(
+                        SnapshotDefinition.Flags.DELETE,
+                        SnapshotDefinition.Flags.FAILED_DEPLOYMENT,
+                        SnapshotDefinition.Flags.FAILED_DISCONNECT
+                    ) || snapDfn.getCreationTime() == null)
+            )
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_INVLD_REMOTE_NAME,
+                        "The given snapshot was not successful and can therefore not be shipped",
+                        true
+                    )
+                );
+            }
+            boolean shipExistingSnap = snapDfn != null;
+            if (remoteTypeRef.equals(RemoteType.S3))
+            {
+                remote = backupHelper.getS3Remote(remoteName);
+                if (shipExistingSnap)
+                {
+                    prevSnapDfn = getIncrementalBaseForExistingSnap(rscDfn, remote, snapDfn, allowIncremental);
+
+                }
+                else
+                {
+                    prevSnapDfn = getIncrementalBase(rscDfn, remote, allowIncremental, false);
+                }
+            }
+            else if (remoteTypeRef.equals(RemoteType.LINSTOR))
+            {
+                remote = backupHelper.getL2LRemote(remoteName);
+                prevSnapDfn = getIncrementalBaseL2L(
+                    rscDfn,
+                    prevSnapDfnUuid,
+                    remote.getName(),
+                    allowIncremental,
+                    responses,
+                    l2lData.getDstRscName()
+                );
+            }
+            else
+            {
+                throw new ImplementationError("remote type " + remoteTypeRef + " not allowed");
+            }
+
+            if (!shipExistingSnap)
+            {
+                snapDfn = snapCrtHelper
+                    .createSnapshots(
+                        Collections.emptyList(),
+                        rscDfn.getName(),
+                        LinstorParsingUtils.asSnapshotName(snapName),
+                        Collections.emptyMap(),
+                        responses
+                    );
+            }
+            ensureMasterKeyIsUnlockedIfNeeded(snapDfn, rscDfn, remote);
+            setBackupSnapDfnProps(snapDfn, scheduleNameRef, nowRef, remoteName);
+            /*
+             * See if the previous snap has already finished shipping. If it hasn't, the current snap must be queued to
+             * prevent two consecutive shippings from happening at the same time
+             */
+            boolean queueAnyways = prevSnapDfn != null && !BackupShippingUtils.hasShippingStatus(
+                prevSnapDfn,
+                remoteName,
+                InternalApiConsts.VALUE_SUCCESS
+            );
+            Node chosenNode = getNodeForBackupOrQueue(
+                rscDfn,
+                prevSnapDfn,
+                snapDfn,
+                remote,
+                nodeName,
+                responses,
+                queueAnyways,
+                l2lData,
+                shipExistingSnap,
+                copySnapsForEvac
+            );
+
+            List<Integer> nodeIds = new ArrayList<>();
+            DrbdRscDfnData<Resource> rscDfnData = rscDfn.getLayerData(
+                DeviceLayerKind.DRBD,
+                RscLayerSuffixes.SUFFIX_DATA
+            );
+            if (rscDfnData != null)
+            {
+                for (DrbdRscData<Resource> rscData : rscDfnData.getDrbdRscDataList())
+                {
+                    if (!rscData.isDiskless())
+                    {
+                        /*
+                         * diskless nodes do reserve a node-id for themselves, but the peer-slot is not used in the
+                         * metadata of diskfull peers
+                         */
+                        nodeIds.add(rscData.getNodeId().value);
+                    }
+                }
+            }
+            setStartBackupProps(snapDfn, remoteName, nodeIds);
+
+            if (remote instanceof S3Remote)
+            {
+                // only do this for s3, l2l does it on its own later on
+                setIncrementalDependentProps(snapDfn, prevSnapDfn, remoteName, scheduleNameRef);
+                // this is used to determine the prevSnap for s3
+                if (!shipExistingSnap)
+                {
+                    rscDfn.getProps()
+                        .setProp(
+                            InternalApiConsts.KEY_BACKUP_LAST_STARTED_OR_QUEUED,
+                            snapName,
+                            BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" +
+                                remote.getName().displayValue
+                        );
+                }
+            }
+            ctrlTransactionHelper.commit();
+
+            responses.addEntry(
+                ApiCallRcImpl.entryBuilder(
+                    ApiConsts.MASK_INFO, "Shipping of resource " + rscNameRef + " to remote " + remoteName +
+                        " in progress."
+                ).putObjRef(ApiConsts.KEY_SNAPSHOT, snapName).build()
+            );
+            Flux<ApiCallRc> flux = Flux.empty();
+            if (!shipExistingSnap)
+            {
+                flux = snapshotCrtHandler.postCreateSnapshot(snapDfn, runInBackgroundRef);
+            }
+            flux = flux.concatWith(Flux.<ApiCallRc>just(responses));
+            if (chosenNode != null)
+            {
+                flux = flux.concatWith(
+                    startShipping(
+                        snapDfn,
+                        chosenNode,
+                        remote,
+                        prevSnapDfn,
+                        responses,
+                        nodeName,
+                        l2lData,
+                        shipExistingSnap
+                    )
+                );
+            }
+            return new BackupSnapshotObj(
+                flux,
+                chosenNode != null ? snapDfn.getSnapshot(chosenNode.getName()) : null
+            );
+        }
+        catch (DatabaseException dbExc)
+        {
+            throw new ApiDatabaseException(dbExc);
+        }
+        catch (InvalidKeyException | InvalidNameException | InvalidValueException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void ensureMasterKeyIsUnlockedIfNeeded(
+        @Nullable SnapshotDefinition snapDfnRef,
+        ResourceDefinition rscDfnRef,
+        AbsRemote remoteRef
+    )
+    {
+        boolean isMasterKeyNeeded = remoteRef instanceof S3Remote;
+        if (!isMasterKeyNeeded)
+        {
+            Collection<AbsResource<?>> absRscList = new ArrayList<>(
+                snapDfnRef != null ?
+                    snapDfnRef.getAllNotDeletingSnapshots() :
+                    rscDfnRef.getNotDeletedDiskful()
+            );
+            for (AbsResource<?> absRsc : absRscList)
+            {
+                List<DeviceLayerKind> layerStack = LayerRscUtils.getLayerStack(
+                    absRsc.getLayerData()
+                );
+                if (layerStack.contains(DeviceLayerKind.LUKS))
+                {
+                    isMasterKeyNeeded = true;
+                    break;
+                }
+            }
+        }
+
+        if (isMasterKeyNeeded)
+        {
+            // test if master key is unlocked
+            if (!ctrlSecObj.areAllSet())
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_INVLD_CRYPT_PASSPHRASE,
+                        "Backup shipping requires a set up encryption. Please use 'linstor encryption " +
+                            "create-passphrase' or '... enter-passphrase'"
+                    )
+                );
+            }
+        }
+    }
+
+    private @Nullable SnapshotDefinition getIncrementalBaseForExistingSnap(
+        ResourceDefinition rscDfn,
+        AbsRemote remote,
+        SnapshotDefinition snapDfn,
+        boolean allowIncremental
+    )
+    {
+        SnapshotDefinition prevSnapDfn = null;
+        if (allowIncremental)
+        {
+            @Nullable Instant crtTime = snapDfn.getCreationTime();
+            @Nullable Instant prevCrtTime = null;
+            for (SnapshotDefinition dfn : rscDfn.getSnapshotDfns())
+            {
+                @Nullable Instant curCrtTime = dfn.getCreationTime();
+                if (
+                    curCrtTime != null && curCrtTime.isBefore(crtTime) &&
+                        (prevCrtTime == null || curCrtTime.isAfter(prevCrtTime))
+                )
+                {
+                    prevCrtTime = curCrtTime;
+                    prevSnapDfn = dfn;
+                }
+            }
+            Set<String> s3Keys = backupHelper.getAllS3Keys((S3Remote) remote, rscDfn.getName().displayValue);
+            if (
+                prevSnapDfn != null && backupHelper.getLatestBackup(
+                    s3Keys,
+                    prevSnapDfn.getName().displayValue
+                ) == null
+            )
+            {
+                errorReporter.logWarning(
+                    "Could not create an incremental backup for resource %s as the previous backup " +
+                        "created by snapshot %s has already been deleted. Creating a full backup instead.",
+                    rscDfn.getName(),
+                    prevSnapDfn.getName()
+                );
+                prevSnapDfn = null;
+            }
+        }
+        return prevSnapDfn;
+    }
+
+    Flux<ApiCallRc> startShipping(
+        SnapshotDefinition snapDfn,
+        Node node,
+        AbsRemote remote,
+        SnapshotDefinition prevSnapDfn,
+        ApiCallRcImpl responses,
+        @Nullable String optPrefNodeName,
+        @Nullable BackupShippingSrcData optL2LData,
+        boolean shipExistingSnapRef
+    )
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Start backup shipping",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> startShippingInTransaction(
+                snapDfn,
+                node,
+                remote,
+                prevSnapDfn,
+                responses,
+                optPrefNodeName,
+                optL2LData,
+                shipExistingSnapRef
+            )
+        );
+    }
+
+    public Flux<ApiCallRc> startShippingInTransaction(
+        SnapshotDefinition snapDfn,
+        Node node,
+        AbsRemote remote,
+        SnapshotDefinition prevSnapDfn,
+        ApiCallRcImpl responsesRef,
+        @Nullable String optPrefNodeName,
+        @Nullable BackupShippingSrcData optL2LData,
+        boolean shipExistingSnapRef
+    )
+    {
+        try
+        {
+            backupHelper.ensureShippingToRemoteAllowed(remote);
+            Flux<ApiCallRc> flux;
+            // doublecheck free shipping slots, if none are free, queue
+            if (getFreeShippingSlots(node) > 0)
+            {
+                Props snapDfnProps = snapDfn.getSnapDfnProps();
+                String propsNamespc = BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remote.getName();
+                snapDfnProps.setProp(
+                    InternalApiConsts.KEY_SHIPPING_STATUS,
+                    InternalApiConsts.VALUE_PREPARE_SHIPPING,
+                    propsNamespc
+                );
+                if (remote instanceof S3Remote)
+                {
+                    snapDfnProps.setProp(
+                        InternalApiConsts.KEY_BACKUP_SRC_NODE,
+                        node.getName().displayValue,
+                        propsNamespc
+                    );
+                }
+                else if (remote instanceof LinstorRemote)
+                {
+                    if (optL2LData == null)
+                    {
+                        throw new ImplementationError("doing l2l-shipping but no l2l-data given");
+                    }
+                    // this is (except the null check) the same as the S3Remote case. we could/should combine them
+                    snapDfnProps.setProp(
+                        InternalApiConsts.KEY_BACKUP_SRC_NODE,
+                        node.getName().displayValue,
+                        propsNamespc
+                    );
+                }
+                // now that it is decided that this node will do the shipping, see if any snapDfn can be moved to the
+                // normal queues
+                QueueItem item = backupInfoMgr.getItemFromPrevNodeUndecidedQueue(snapDfn, remote);
+                if (item != null)
+                {
+                    // return value is ignored since queueAnyways is set
+                    getNodeForBackupOrQueue(
+                        snapDfn.getResourceDefinition(),
+                        snapDfn,
+                        item.snapDfn,
+                        item.s3orLinRemote,
+                        item.preferredNode,
+                        responsesRef,
+                        true, // always queue to avoid simultaneous shippings of consecutive backups
+                        item.l2lData,
+                        shipExistingSnapRef,
+                        false
+                    );
+                }
+
+                Snapshot snap = snapDfn.getSnapshot(node.getName());
+                snap.setShipBackup(true);
+                if (remote instanceof S3Remote)
+                {
+                    // make stlt start shipping - l2l needs to do this later
+                    snapDfnProps.setProp(
+                        InternalApiConsts.KEY_SHIPPING_STATUS,
+                        InternalApiConsts.VALUE_SHIPPING,
+                        propsNamespc
+                    );
+                    // KEY_BACKUP_TARGET_REMOTE was set here previously - this is not needed for s3, since the remote is
+                    // now part of the namespace - for l2l it will still be needed since there we save the stlt-remote
+                }
+                if (prevSnapDfn != null)
+                {
+                    snapDfnProps.setProp(
+                            InternalApiConsts.KEY_BACKUP_LAST_SNAPSHOT,
+                            prevSnapDfn.getName().displayValue,
+                            propsNamespc
+                        );
+                }
+
+                ctrlTransactionHelper.commit();
+                flux = ctrlSatelliteUpdateCaller.updateSatellites(snapDfn, CtrlSatelliteUpdateCaller.notConnectedWarn())
+                    .transform(
+                        responses -> CtrlResponseUtils
+                            .combineResponses(
+                                errorReporter, responses, snapDfn.getResourceName(), "Started shipping of resource {1}")
+                    )
+                    .concatWith(
+                        snapshotCrtHandler.removeInProgressSnapshots(
+                            new CreateMultiSnapRequest(snapDfn)
+                        )
+                    );
+            }
+            else
+            {
+                // we ignore any chance that the shipping could be started on a different node and instead queue
+                // anyways, for simplicity's sake
+                getNodeForBackupOrQueue(
+                    snapDfn.getResourceDefinition(),
+                    prevSnapDfn,
+                    snapDfn,
+                    remote,
+                    optPrefNodeName,
+                    responsesRef,
+                    true, // queue anyways
+                    optL2LData,
+                    shipExistingSnapRef,
+                    false
+                );
+                flux = Flux.empty();
+            }
+            return flux;
+        }
+        catch (DatabaseException dbExc)
+        {
+            throw new ApiDatabaseException(dbExc);
+        }
+        catch (InvalidKeyException | InvalidValueException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    /**
+     * Deletes the queue of the given node and also re-queues any snapDfns that were only in its queue (or starts them
+     * if possible).
+     */
+    public void deleteNodeQueue(Peer peer)
+    {
+        Node node = peer.getNode();
+        if (!node.isDeleted())
+        {
+            Flux<ApiCallRc> flux = deleteNodeQueueAndReQueueSnapsIfNeeded(peer.getNode());
+            Thread thread = new Thread(() ->
+                flux.contextWrite(
+                    Context.of(
+                        Peer.class,
+                        peer,
+                        ApiModule.API_CALL_NAME,
+                        "delete node queue"
+                    )
+                ).subscribe(ignoredResults -> { }, errorReporter::reportError)
+            );
+            thread.start();
+        }
+    }
+
+    public Flux<ApiCallRc> deleteNodeQueueAndReQueueSnapsIfNeeded(String nodeName)
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Delete node queue",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> deleteNodeQueueAndReQueueSnapsIfNeededInTransaction(ctrlApiDataLoader.loadNodeOrNull(nodeName))
+        );
+    }
+
+    /*
+     * Deletes the queue of the given node and checks if any snapDfn is not being shipped anymore because of it.
+     * If so, finds new nodes to ship that snapDfn from and either queues it there or starts the shipping.
+     */
+    public Flux<ApiCallRc> deleteNodeQueueAndReQueueSnapsIfNeeded(Node node)
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Delete node queue",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> deleteNodeQueueAndReQueueSnapsIfNeededInTransaction(node)
+        );
+    }
+
+    private Flux<ApiCallRc> deleteNodeQueueAndReQueueSnapsIfNeededInTransaction(@Nullable Node node)
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        if (node != null && !node.isDeleted())
+        {
+            List<QueueItem> itemsToReQueue = backupInfoMgr.deleteFromQueue(node);
+            ApiCallRcImpl responses = new ApiCallRcImpl();
+            for (QueueItem item : itemsToReQueue)
+            {
+                SnapshotDefinition prevSnap = item.prevSnapDfn;
+                if (prevSnap != null)
+                {
+                    boolean needsNewPrevSnap = false;
+                    boolean isDeleted = prevSnap.isDeleted() ||
+                        prevSnap.getFlags().isSet(SnapshotDefinition.Flags.DELETE);
+                    if (isDeleted)
+                    {
+                        needsNewPrevSnap = true;
+                    }
+                    else
+                    {
+                        boolean isLastSnapOnNodeToClear = prevSnap.getAllNotDeletingSnapshots()
+                            .size() == 1 && prevSnap.getSnapshot(node.getName()) != null;
+                        if (isLastSnapOnNodeToClear)
+                        {
+                            needsNewPrevSnap = true;
+                        }
+                    }
+                    if (needsNewPrevSnap)
+                    {
+                        /*
+                         * TODO: a better but far more complicated option would be to do the same flux-loop-stuff as
+                         * with startQueuedL2LShippingInTransaction in order to get a new prevSnap from the
+                         * targetCluster
+                         * instead, we simply force a full backup
+                         */
+                        prevSnap = null;
+                    }
+                }
+                Node shipFromNode = getNodeForBackupOrQueue(
+                    item.snapDfn.getResourceDefinition(),
+                    prevSnap,
+                    item.snapDfn,
+                    item.s3orLinRemote,
+                    item.preferredNode,
+                    responses,
+                    false,
+                    item.l2lData,
+                    item.shipExistingSnap,
+                    false
+                );
+                if (shipFromNode != null)
+                {
+                    flux = flux.concatWith(
+                        startShippingInTransaction(
+                            item.snapDfn,
+                            shipFromNode,
+                            item.s3orLinRemote,
+                            item.prevSnapDfn,
+                            responses,
+                            item.preferredNode,
+                            item.l2lData,
+                            item.shipExistingSnap
+                        )
+                    );
+                }
+            }
+            flux = flux.concatWith(Flux.just(responses));
+        }
+        return flux;
+    }
+
+    @Nullable
+    public Node getNodeForBackupOrQueue(
+        ResourceDefinition rscDfn,
+        @Nullable SnapshotDefinition prevSnapDfn,
+        SnapshotDefinition snapDfn,
+        AbsRemote remote,
+        @Nullable String prefNodeName,
+        ApiCallRcImpl responses,
+        boolean queueAnyways,
+        @Nullable BackupShippingSrcData l2lData,
+        boolean shipExistingSnapRef,
+        boolean copySnapsForEvac
+    )
+    {
+        Set<Node> usableNodes = backupNodeFinder.findUsableNodes(
+            rscDfn,
+            shipExistingSnapRef ? snapDfn : null,
+            prevSnapDfn,
+            remote,
+            l2lData == null ? null : l2lData.getDstRscName(),
+            copySnapsForEvac
+        );
+        Node chosenNode = null;
+        if (!queueAnyways)
+        {
+            chosenNode = chooseNode(usableNodes, prefNodeName, responses, remote.getType().getOptionalExtTools());
+        }
+        if (chosenNode == null)
+        {
+            responses.addEntry(
+                "Maximum amount of shippings met on all nodes, adding to queue instead",
+                ApiConsts.MASK_WARN
+            );
+            // the remote needs to be the LinstorRemote in L2L-cases, since the target node is not yet decided
+            // on.
+            // usableNodes might be empty, in that case the snapDfn is added to the prevNodeUndecidedQueue
+            backupInfoMgr.addToQueues(
+                snapDfn,
+                remote,
+                prevSnapDfn,
+                prefNodeName,
+                l2lData,
+                usableNodes,
+                shipExistingSnapRef
+            );
+        }
+        return chosenNode;
+    }
+
+    private void setBackupSnapDfnProps(
+        SnapshotDefinition snapDfn,
+        @Nullable String scheduleNameRef,
+        LocalDateTime nowRef,
+        String remoteName
+    )
+        throws DatabaseException, InvalidKeyException, InvalidValueException
+    {
+        if (scheduleNameRef != null)
+        {
+            snapDfn.getSnapDfnProps()
+                .setProp(
+                    InternalApiConsts.KEY_BACKUP_SHIPPED_BY_SCHEDULE,
+                    scheduleNameRef,
+                    InternalApiConsts.NAMESPC_SCHEDULE
+                );
+        }
+        /*
+         * This prop ensures that upon backup restore the resource does not skip the initial sync
+         * This is necessary because the metadata needs to be recreated during the restore, since uploads from different
+         * nodes might have corrupted the metadata.
+         * Recreating the metadata leads to the loss of the day0-uuid which is needed to skip the initial full sync
+         */
+        /*
+         * The prop needs to be on the rscDfn during/after the restore. Any change to the way props get restored needs
+         * to take this into consideration
+         */
+        snapDfn.getRscDfnPropsForChange()
+            .setProp(
+                InternalApiConsts.KEY_FORCE_INITIAL_SYNC_PERMA,
+                ApiConsts.VAL_TRUE,
+                ApiConsts.NAMESPC_DRBD_OPTIONS
+            );
+        String backupNamespc = BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remoteName;
+        snapDfn.getSnapDfnProps()
+            .setProp(
+                InternalApiConsts.KEY_BACKUP_START_TIMESTAMP,
+                Long.toString(TimeUtils.getEpochMillis(nowRef)),
+                backupNamespc
+            );
+
+        // save the s3 suffix as prop so that when restoring the satellite can reconstruct the .meta name
+        // (s3 suffix is NOT part of snapshot name)
+        String s3Suffix = sysCfgRepo.getStltConfForView().getProp(
+            ApiConsts.KEY_BACKUP_S3_SUFFIX,
+            ApiConsts.NAMESPC_BACKUP_SHIPPING
+        );
+        if (s3Suffix != null)
+        {
+            snapDfn.getSnapDfnProps()
+                .setProp(
+                ApiConsts.KEY_BACKUP_S3_SUFFIX,
+                s3Suffix,
+                    backupNamespc
+            );
+        }
+    }
+
+    private void setStartBackupProps(
+        SnapshotDefinition snapDfn,
+        String remoteName,
+        List<Integer> nodeIds
+    ) throws InvalidKeyException, DatabaseException, InvalidValueException
+    {
+        snapDfn.getSnapDfnProps()
+            .setProp(
+                InternalApiConsts.KEY_BACKUP_NODE_IDS_TO_RESET,
+                StringUtils.join(nodeIds, InternalApiConsts.KEY_BACKUP_NODE_ID_SEPERATOR),
+                ApiConsts.NAMESPC_BACKUP_SHIPPING
+            );
+        snapDfn.getSnapDfnProps()
+            .setProp(
+                InternalApiConsts.KEY_BACKUP_TARGET_REMOTE,
+                remoteName,
+                BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remoteName
+            );
+    }
+
+    /**
+     * Returns the number of free shipping slots - that is, the active shippings subtracted from the maximum specified
+     * in KEY_MAX_CONCURRENT_BACKUPS_PER_NODE.
+     * This method assumes that any new shipping that should be added based on the return value of this method does not
+     * yet count as active.
+     */
+    public int getFreeShippingSlots(Node node)
+    {
+        int activeShippings = 0;
+        for (Snapshot snap : node.getSnapshots())
+        {
+            ReadOnlyProps sourceProps = snap.getSnapshotDefinition()
+                .getSnapDfnProps()
+                .getNamespaceOrEmpty(BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC);
+            Iterator<String> remoteIter = sourceProps.iterateNamespaces();
+            while (remoteIter.hasNext())
+            {
+                String remoteName = remoteIter.next();
+                @Nullable String shippingStatus = sourceProps.getProp(
+                    InternalApiConsts.KEY_SHIPPING_STATUS, remoteName
+                );
+                if (
+                    InternalApiConsts.VALUE_SHIPPING.equals(shippingStatus) ||
+                        InternalApiConsts.VALUE_PREPARE_SHIPPING.equals(shippingStatus)
+                )
+                {
+                    activeShippings++;
+                }
+            }
+        }
+        PriorityProps prioProps = new PriorityProps(
+            node.getProps(),
+            sysCfgRepo.getCtrlConfForView()
+        );
+        String maxBackups = prioProps.getProp(
+            ApiConsts.KEY_MAX_CONCURRENT_BACKUPS_PER_NODE,
+            ApiConsts.NAMESPC_BACKUP_SHIPPING
+        );
+        int freeShippingSlots = Integer.MAX_VALUE;
+        if (maxBackups != null)
+        {
+            int maxBackupsParsed = Integer.parseInt(maxBackups);
+            freeShippingSlots = maxBackupsParsed < 0 ? Integer.MAX_VALUE : maxBackupsParsed;
+        }
+        return freeShippingSlots - activeShippings;
+    }
+
+    /**
+     * Gets the incremental backup base for the given resource. This checks for the last successful snapshot with a
+     * matching backup shipping property.
+     *
+     * @param rscDfn
+     *     the resource definition for which previous backups should be found.
+     * @param remote
+     *     The remote, used to memorise previous snapshots.
+     * @param allowIncremental
+     *     If false, this will always return null, indicating a full backup should be created.
+     *
+     * @return The snapshot definition of the last snapshot uploaded to the given remote. Returns null if incremental
+     * backups not allowed, no snapshot was found, or the found snapshot was not compatible.
+     *
+     * @throws InvalidNameException
+     *     when detected previous snapshot name is invalid
+     */
+    public @Nullable SnapshotDefinition getIncrementalBase(
+        ResourceDefinition rscDfn,
+        AbsRemote remote,
+        boolean allowIncremental,
+        boolean replacePrevSnap
+    )
+        throws InvalidNameException
+    {
+        @Nullable SnapshotDefinition prevSnapDfn = null;
+        if (allowIncremental)
+        {
+            String prevSnapName;
+            if (replacePrevSnap)
+            {
+                prevSnapName = rscDfn.getProps()
+                    .getProp(
+                        InternalApiConsts.KEY_BACKUP_LAST_SNAPSHOT,
+                        BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remote.getName()
+                    );
+            }
+            else
+            {
+                prevSnapName = rscDfn.getProps()
+                    .getProp(
+                        InternalApiConsts.KEY_BACKUP_LAST_STARTED_OR_QUEUED,
+                        BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remote.getName()
+                    );
+            }
+
+            if (prevSnapName != null)
+            {
+                prevSnapDfn = ctrlApiDataLoader.loadSnapshotDfnOrNull(rscDfn, new SnapshotName(prevSnapName));
+                if (
+                    prevSnapDfn == null || prevSnapDfn.isDeleted() ||
+                        prevSnapDfn.getFlags().isSet(SnapshotDefinition.Flags.DELETE)
+                )
+                {
+                    errorReporter.logWarning(
+                        "Could not create an incremental backup for resource %s as the previous snapshot %s needed " +
+                            "for the incremental backup has already been deleted. Creating a full backup instead.",
+                        rscDfn.getName(),
+                        prevSnapName
+                    );
+                }
+                else
+                {
+                    if (
+                        remote instanceof S3Remote s3remote && BackupShippingUtils.hasShippingStatus(
+                            prevSnapDfn,
+                            remote.getName().displayValue,
+                            InternalApiConsts.VALUE_SUCCESS
+                        )
+                    )
+                    {
+                        ApiCallRcImpl apiCallRc = new ApiCallRcImpl();
+                        Map<String, S3ObjectInfo> s3LinstorObjects = backupHelper.loadAllLinstorS3Objects(
+                            s3remote,
+                            apiCallRc
+                        );
+                        boolean found = false;
+                        for (S3ObjectInfo s3obj : s3LinstorObjects.values())
+                        {
+                            SnapshotDefinition snapDfn = s3obj.getSnapDfn();
+                            if (snapDfn != null && snapDfn.getUuid().equals(prevSnapDfn.getUuid()))
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found)
+                        {
+                            errorReporter.logWarning(
+                                "Could not create an incremental backup for resource %s as the previous backup " +
+                                    "created by snapshot %s has already been deleted. Creating a full backup instead.",
+                                rscDfn.getName(),
+                                prevSnapName
+                            );
+                            // theoretically we could look for the backup before prevSnapDfn and then the one before
+                            // that and so on...
+                            prevSnapDfn = null;
+                        }
+                    }
+                    if (prevSnapDfn != null)
+                    {
+                        for (SnapshotVolumeDefinition snapVlmDfn : prevSnapDfn.getAllSnapshotVolumeDefinitions())
+                        {
+                            long vlmDfnSize = snapVlmDfn.getVolumeDefinition().getVolumeSize();
+                            long prevSnapVlmDfnSize = snapVlmDfn.getVolumeSize();
+                            if (prevSnapVlmDfnSize != vlmDfnSize)
+                            {
+                                errorReporter.logDebug(
+                                    "Current vlmDfn size (%d) does not match with prev snapDfn (%s) size (%d). " +
+                                        "Forcing full backup.",
+                                    vlmDfnSize,
+                                    snapVlmDfn,
+                                    prevSnapVlmDfnSize
+                                );
+                                prevSnapDfn = null;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                errorReporter.logWarning(
+                    "Could not create an incremental backup for resource %s as there is no previous full backup. " +
+                        "Creating a full backup instead.",
+                    rscDfn.getName()
+                );
+            }
+        }
+
+        return prevSnapDfn;
+    }
+
+    public @Nullable SnapshotDefinition getIncrementalBaseL2L(
+        ResourceDefinition rscDfn,
+        @Nullable String prevSnapDfnUuid,
+        RemoteName remoteName,
+        boolean allowIncremental,
+        ApiCallRcImpl responses,
+        String targetRscName
+    )
+    {
+        SnapshotDefinition prevSnapDfn = null;
+        if (allowIncremental)
+        {
+            boolean respMsgSet = false;
+            if (prevSnapDfnUuid != null)
+            {
+                for (SnapshotDefinition snapDfn : rscDfn.getSnapshotDfns())
+                {
+                    if (snapDfn.getUuid().toString().equals(prevSnapDfnUuid))
+                    {
+                        String prevNodeStr = snapDfn.getSnapDfnProps()
+                            .getProp(
+                                InternalApiConsts.KEY_BACKUP_SRC_NODE,
+                                BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remoteName
+                            );
+                        if (prevNodeStr != null)
+                        {
+                            @Nullable Node prevNode = ctrlApiDataLoader.loadNodeOrNull(prevNodeStr);
+                            if (prevNode != null)
+                            {
+                                boolean isNodeAvailable = !prevNode.getFlags()
+                                    .isSomeSet(
+                                        Node.Flags.DELETE,
+                                        Node.Flags.EVACUATE,
+                                        Node.Flags.EVICTED
+                                    ) && prevNode.getPeer().isOnline();
+                                if (isNodeAvailable)
+                                {
+                                    prevSnapDfn = snapDfn;
+                                }
+                                else
+                                {
+                                    respMsgSet = true;
+                                    responses.addEntry(
+                                        ApiCallRcImpl.simpleEntry(
+                                            ApiConsts.MASK_WARN,
+                                            "Node " + prevNode +
+                                                " is needed for an incremental backup, " +
+                                                "but is offline or otherwise unavailable (deleting, evicted, etc)"
+                                        )
+                                    );
+                                }
+                            }
+                            else
+                            {
+                                respMsgSet = true;
+                                responses.addEntry(
+                                    ApiCallRcImpl.simpleEntry(
+                                        ApiConsts.MASK_WARN,
+                                        "Node " + prevNodeStr +
+                                            " is needed for an incremental backup, " +
+                                            "but seems to have already been deleted"
+                                    )
+                                );
+                            }
+                        }
+                        else
+                        {
+                            respMsgSet = true;
+                            responses.addEntry(
+                                ApiCallRcImpl.simpleEntry(
+                                    ApiConsts.MASK_INFO,
+                                    "Unable to discern which node shipped the last incremental backup"
+                                )
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            if (prevSnapDfn == null)
+            {
+                if (!respMsgSet)
+                {
+                    responses.addEntry(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.MASK_INFO,
+                            "No common snapshot found"
+                        )
+                    );
+                }
+                responses.addEntry(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.MASK_WARN,
+                        "Could not create an incremental backup for resource " + rscDfn +
+                            ", creating full backup instead"
+                    )
+                );
+            }
+        }
+        return prevSnapDfn;
+    }
+
+    private @Nullable Node chooseNode(
+        Set<Node> nodesList,
+        @Nullable String prefNode,
+        ApiCallRcImpl responses,
+        Map<ExtTools, ExtToolsInfo.Version> optionalExtToolsMap
+    )
+    {
+        List<Node> nodes = new ArrayList<>(nodesList);
+        Node ret = null;
+        // check prefNode first so in case pref exists, it is not checked twice
+        @Nullable Node pref = prefNode == null ? null : ctrlApiDataLoader.loadNodeOrNull(prefNode);
+        if (pref != null && nodes.contains(pref) && getFreeShippingSlots(pref) > 0)
+        {
+            ret = pref;
+        }
+        else
+        {
+            TreeMap<Integer, List<Node>> sortedWithExtTools = new TreeMap<>();
+            TreeMap<Integer, List<Node>> sortedNoExtTools = new TreeMap<>();
+
+            for (Node node : nodes)
+            {
+                int freeShippingSlots = getFreeShippingSlots(node);
+                if (freeShippingSlots > 0)
+                {
+                    Map<Integer, List<Node>> targetMap;
+                    if (hasNodeAllExtTools(node, optionalExtToolsMap, null, null))
+                    {
+                        targetMap = sortedWithExtTools;
+                    }
+                    else
+                    {
+                        targetMap = sortedNoExtTools;
+                    }
+
+                    targetMap.computeIfAbsent(
+                        freeShippingSlots,
+                        k -> new ArrayList<>()
+                    ).add(node);
+                }
+                // else no slots open
+            }
+            // take the one with the most free shipping slots, preferably from the list with all ext tools
+            if (!sortedWithExtTools.isEmpty())
+            {
+                ret = sortedWithExtTools.lastEntry().getValue().get(0);
+            }
+            else if (!sortedNoExtTools.isEmpty())
+            {
+                ret = sortedNoExtTools.lastEntry().getValue().get(0);
+            }
+            if (ret != null)
+            {
+                if (prefNode != null)
+                {
+                    responses.addEntry(
+                        "Preferred node '" + prefNode + "' could not be selected. Choosing '" + ret.getName() +
+                            "' instead.",
+                        ApiConsts.MASK_WARN
+                    );
+                }
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * Makes sure the given node has all ext-tools given
+     */
+    public static boolean hasNodeAllExtTools(
+        Node node,
+        Map<ExtTools, ExtToolsInfo.Version> extTools,
+        @Nullable ApiCallRcImpl apiCallRcRef,
+        @Nullable String errorMsgPrefix
+    )
+    {
+        boolean ret = true;
+        if (extTools != null)
+        {
+            ExtToolsManager extToolsMgr = node.getPeer().getExtToolsManager();
+            StringBuilder sb = new StringBuilder();
+            for (Entry<ExtTools, Version> extTool : extTools.entrySet())
+            {
+                ExtToolsInfo extToolInfo = extToolsMgr.getExtToolInfo(extTool.getKey());
+                Version requiredVersion = extTool.getValue();
+                if (
+                    extToolInfo == null || !extToolInfo.isSupported() ||
+                        (requiredVersion != null && !extToolInfo.hasVersionOrHigher(requiredVersion))
+                )
+                {
+                    ret = false;
+                    sb.append(extTool.getKey());
+                    if (requiredVersion != null)
+                    {
+                        sb.append(" (").append(requiredVersion.toString()).append(")");
+                    }
+                    sb.append(", ");
+                }
+            }
+            if (sb.length() > 0 && apiCallRcRef != null)
+            {
+                sb.setLength(sb.length() - 2);
+                apiCallRcRef.addEntry(errorMsgPrefix + sb.toString(), ApiConsts.MASK_INFO);
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * Sets all the props that differ depending on whether the backup is full or incremental
+     */
+    void setIncrementalDependentProps(
+        SnapshotDefinition curSnapDfn,
+        @Nullable SnapshotDefinition prevSnapDfn,
+        String remoteName,
+        @Nullable String scheduleName
+    )
+        throws InvalidValueException, DatabaseException
+    {
+        Props snapDfnProps = curSnapDfn.getSnapDfnProps();
+        Props rscDfnProps = curSnapDfn.getResourceDefinition().getProps();
+        String backupNamespc = BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + remoteName;
+        if (prevSnapDfn == null)
+        {
+            snapDfnProps.setProp(
+                InternalApiConsts.KEY_LAST_FULL_BACKUP_TIMESTAMP,
+                curSnapDfn.getName().displayValue,
+                backupNamespc
+            );
+            if (scheduleName != null)
+            {
+                rscDfnProps.setProp(
+                    remoteName + ReadOnlyProps.PATH_SEPARATOR + scheduleName + ReadOnlyProps.PATH_SEPARATOR +
+                        InternalApiConsts.KEY_LAST_BACKUP_INC,
+                    ApiConsts.VAL_FALSE,
+                    InternalApiConsts.NAMESPC_SCHEDULE
+                );
+            }
+        }
+        else
+        {
+            snapDfnProps.setProp(
+                InternalApiConsts.KEY_LAST_FULL_BACKUP_TIMESTAMP,
+                prevSnapDfn.getSnapDfnProps()
+                    .getProp(
+                        InternalApiConsts.KEY_LAST_FULL_BACKUP_TIMESTAMP,
+                        backupNamespc
+                    ),
+                backupNamespc
+            );
+            if (scheduleName != null)
+            {
+                rscDfnProps.setProp(
+                    remoteName + ReadOnlyProps.PATH_SEPARATOR + scheduleName + ReadOnlyProps.PATH_SEPARATOR +
+                        InternalApiConsts.KEY_LAST_BACKUP_INC,
+                    ApiConsts.VAL_TRUE,
+                    InternalApiConsts.NAMESPC_SCHEDULE
+                );
+            }
+        }
+        if (scheduleName != null)
+        {
+            rscDfnProps.setProp(
+                remoteName + ReadOnlyProps.PATH_SEPARATOR + scheduleName + ReadOnlyProps.PATH_SEPARATOR +
+                    InternalApiConsts.KEY_LAST_BACKUP_TIME,
+                Long.toString(System.currentTimeMillis()),
+                InternalApiConsts.NAMESPC_SCHEDULE
+            );
+        }
+    }
+
+    static class BackupSnapshotObj
+    {
+        private final Flux<ApiCallRc> flux;
+        private final @Nullable Snapshot snap;
+
+        BackupSnapshotObj(Flux<ApiCallRc> fluxRef, @Nullable Snapshot snapRef)
+        {
+            flux = fluxRef;
+            snap = snapRef;
+        }
+
+        Flux<ApiCallRc> getFlux()
+        {
+            return flux;
+        }
+
+        @Nullable
+        Snapshot getSnap()
+        {
+            return snap;
+        }
+    }
+}

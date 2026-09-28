@@ -1,0 +1,505 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.pojo.RscConnPojo;
+import com.linbit.linstor.api.prop.LinStorObject;
+import com.linbit.linstor.core.StltConfigAccessor;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlPropsHelper.PropertyChangedListener;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperContext;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperResult;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscAutoHelper;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.PropsChangedListenerBuilder;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.ResourceList;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.ApiSuccessUtils;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.apis.ResourceConnectionApi;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceConnection;
+import com.linbit.linstor.core.objects.ResourceConnectionKey;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.repository.NodeRepository;
+import com.linbit.linstor.core.repository.ResourceDefinitionRepository;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.satellitestate.SatelliteState;
+import com.linbit.linstor.utils.layer.DrbdLayerUtils;
+import com.linbit.locks.LockGuardFactory;
+
+import static com.linbit.locks.LockGuardFactory.LockObj.NODES_MAP;
+import static com.linbit.locks.LockGuardFactory.LockObj.RSC_DFN_MAP;
+import static com.linbit.locks.LockGuardFactory.LockObj.STOR_POOL_DFN_MAP;
+import static com.linbit.locks.LockGuardFactory.LockType.WRITE;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.locks.Lock;
+
+import reactor.core.publisher.Flux;
+
+import static java.util.stream.Collectors.toList;
+
+@Singleton
+public class CtrlRscApiCallHandler
+{
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlPropsHelper ctrlPropsHelper;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final ResourceDefinitionRepository resourceDefinitionRepository;
+    private final NodeRepository nodeRepository;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final ResponseConverter responseConverter;
+    private final Provider<Peer> peer;
+    private final ScopeRunner scopeRunner;
+    private final LockGuardFactory lockGuardFactory;
+    private final StltConfigAccessor stltCfgAccessor;
+    private final Provider<PropsChangedListenerBuilder> propsChangeListenerBuilderProvider;
+    private final Provider<CtrlRscAutoHelper> ctrlRscAutoHelperProvider;
+
+    @Inject
+    public CtrlRscApiCallHandler(
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlPropsHelper ctrlPropsHelperRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        ResourceDefinitionRepository resourceDefinitionRepositoryRef,
+        NodeRepository nodeRepositoryRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        ResponseConverter responseConverterRef,
+        Provider<Peer> peerRef,
+        ScopeRunner scopeRunnerRef,
+        LockGuardFactory lockGuardFactoryRef,
+        StltConfigAccessor stltCfgAccessorRef,
+        Provider<PropsChangedListenerBuilder> propsChangeListenerBuilderProviderRef,
+        Provider<CtrlRscAutoHelper> ctrlRscAutoHelperProviderRef
+    )
+    {
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlPropsHelper = ctrlPropsHelperRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        resourceDefinitionRepository = resourceDefinitionRepositoryRef;
+        nodeRepository = nodeRepositoryRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        responseConverter = responseConverterRef;
+        peer = peerRef;
+        scopeRunner = scopeRunnerRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        stltCfgAccessor = stltCfgAccessorRef;
+        propsChangeListenerBuilderProvider = propsChangeListenerBuilderProviderRef;
+        ctrlRscAutoHelperProvider = ctrlRscAutoHelperProviderRef;
+    }
+
+    public Flux<ApiCallRc> modify(
+        @Nullable UUID rscUuid,
+        String nodeNameStr,
+        String rscNameStr,
+        Map<String, String> overrideProps,
+        Set<String> deletePropKeys,
+        Set<String> deletePropNamespaces,
+        @Nullable Boolean tiebreakerFlagRef,
+        @Nullable Boolean drbdClientFlagRef
+    )
+    {
+        ResponseContext context = makeRscContext(
+            ApiOperation.makeModifyOperation(),
+            nodeNameStr,
+            rscNameStr
+        );
+
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Modify resource",
+                lockGuardFactory.buildDeferred(
+                    WRITE,
+                    NODES_MAP, RSC_DFN_MAP, STOR_POOL_DFN_MAP
+                ),
+                () -> modifyInTransaction(
+                    rscUuid,
+                    nodeNameStr,
+                    rscNameStr,
+                    overrideProps,
+                    deletePropKeys,
+                    deletePropNamespaces,
+                    tiebreakerFlagRef,
+                    drbdClientFlagRef,
+                    context
+                )
+            )
+            .transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> modifyInTransaction(
+        @Nullable UUID rscUuid,
+        String nodeNameStr,
+        String rscNameStr,
+        Map<String, String> overrideProps,
+        Set<String> deletePropKeys,
+        Set<String> deletePropNamespacesRef,
+        @Nullable Boolean tiebreakerFlagRef,
+        @Nullable Boolean drbdClientFlagRef,
+        ResponseContext context
+    )
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        ApiCallRcImpl apiCallRcs = new ApiCallRcImpl();
+        boolean notifyStlts = false;
+
+        List<Flux<ApiCallRc>> specialPropFluxes = new ArrayList<>();
+        try
+        {
+            Resource rsc = ctrlApiDataLoader.loadRsc(nodeNameStr, rscNameStr);
+
+            if (rscUuid != null && !rscUuid.equals(rsc.getUuid()))
+            {
+                throw new ApiRcException(ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_UUID_RSC,
+                    "UUID-check failed"
+                ));
+            }
+
+            Map<String, PropertyChangedListener> propsChangedListeners = propsChangeListenerBuilderProvider.get()
+                .buildPropsChangedListeners(rsc, specialPropFluxes);
+
+            Props props = ctrlPropsHelper.getProps(rsc);
+
+            // check if specified preferred network interface exists
+            ctrlPropsHelper.checkPrefNic(
+                rsc.getNode(),
+                overrideProps.get(ApiConsts.KEY_STOR_POOL_PREF_NIC),
+                ApiConsts.MASK_RSC
+            );
+            ctrlPropsHelper.checkPrefNic(
+                rsc.getNode(),
+                overrideProps.get(ApiConsts.NAMESPC_NVME + "/" + ApiConsts.KEY_PREF_NIC),
+                ApiConsts.MASK_RSC
+            );
+            // check if specified "outside address" network interface exists
+            ctrlPropsHelper.checkPrefOutsideAddress(
+                rsc.getNode(),
+                overrideProps.get(
+                    ApiConsts.NAMESPC_LINSTOR_DRBD + "/" + ApiConsts.KEY_DRBD_OUTSIDE_ADDRESS
+                ),
+                ApiConsts.MASK_RSC
+            );
+
+            notifyStlts = ctrlPropsHelper.fillProperties(
+                apiCallRcs,
+                LinStorObject.RSC,
+                overrideProps,
+                props,
+                ApiConsts.FAIL_ACC_DENIED_RSC,
+                Collections.emptyList(),
+                propsChangedListeners
+            ) || notifyStlts;
+            notifyStlts = ctrlPropsHelper.remove(
+                apiCallRcs,
+                LinStorObject.RSC,
+                props,
+                deletePropKeys,
+                deletePropNamespacesRef,
+                Collections.emptyList(),
+                propsChangedListeners
+            ) || notifyStlts;
+
+            boolean flagsChanged = false;
+            if (tiebreakerFlagRef != null && tiebreakerFlagRef && drbdClientFlagRef != null && drbdClientFlagRef)
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_INVLD_CONF,
+                        "Tiebreaker flag and DRBD client flag are mutually exclusive flags, but both were set"
+                    )
+                );
+            }
+            if (tiebreakerFlagRef != null)
+            {
+                flagsChanged |= DrbdLayerUtils.setTiebreaker(rsc, tiebreakerFlagRef);
+            }
+            if (drbdClientFlagRef != null)
+            {
+                flagsChanged |= DrbdLayerUtils.setClientFlag(rsc, drbdClientFlagRef);
+            }
+
+            Flux<ApiCallRc> autoFlux;
+            if (flagsChanged)
+            {
+                notifyStlts = true;
+                AutoHelperResult autoHelperResult = ctrlRscAutoHelperProvider.get()
+                    .manage(new AutoHelperContext(apiCallRcs, context, rsc.getResourceDefinition()));
+                autoFlux = autoHelperResult.flux();
+            }
+            else
+            {
+                autoFlux = Flux.empty();
+            }
+
+            ctrlTransactionHelper.commit();
+
+            responseConverter.addWithOp(apiCallRcs, context, ApiSuccessUtils.defaultModifiedEntry(
+                rsc.getUuid(), getRscDescriptionInline(rsc)));
+
+            if (notifyStlts)
+            {
+                flux = ctrlSatelliteUpdateCaller
+                        .updateSatellites(rsc.getResourceDefinition(), Flux.empty())
+                    .flatMap(updateTuple -> updateTuple == null ? Flux.empty() : updateTuple.getT2())
+                    .concatWith(autoFlux);
+            }
+        }
+        catch (Exception | ImplementationError exc)
+        {
+            apiCallRcs = responseConverter.reportException(peer.get(), context, exc);
+        }
+
+        return Flux.just((ApiCallRc) apiCallRcs)
+            .concatWith(flux)
+            .concatWith(Flux.merge(specialPropFluxes));
+    }
+
+    ResourceList listResources(
+        String rscNameStr,
+        List<String> filterNodes
+    )
+    {
+        // fake load and fail if not exists
+        ctrlApiDataLoader.loadRscDfn(rscNameStr);
+
+        List<String> rscList = new ArrayList<>();
+        rscList.add(rscNameStr);
+        return listResources(filterNodes, rscList);
+    }
+
+    ResourceList listResources(
+        List<String> filterNodes,
+        List<String> filterResources
+    )
+    {
+        final ResourceList rscList = new ResourceList();
+        final List<String> upperFilterNodes = filterNodes.stream().map(String::toUpperCase).collect(toList());
+        final List<String> upperFilterResources =
+            filterResources.stream().map(String::toUpperCase).collect(toList());
+
+        resourceDefinitionRepository.getMapForView().values().stream()
+            .filter(rscDfn -> upperFilterResources.isEmpty() ||
+                upperFilterResources.contains(rscDfn.getName().value))
+            .forEach(rscDfn ->
+            {
+                for (Resource rsc : rscDfn.streamResource()
+                    .filter(rsc -> upperFilterNodes.isEmpty() ||
+                        upperFilterNodes.contains(rsc.getNode().getName().value))
+                    .collect(toList()))
+                {
+                    rscList.addResource(
+                        rsc.getApiData(
+                            null,
+                            null,
+                            rsc.getEffectiveProps(stltCfgAccessor)
+                        )
+                    );
+                    // fullSyncId and updateId null, as they are not going to be serialized anyways
+                }
+            }
+            );
+
+        // get resource states of all nodes
+        for (final Node node : nodeRepository.getMapForView().values())
+        {
+            if (upperFilterNodes.isEmpty() || upperFilterNodes.contains(node.getName().value))
+            {
+                final Peer curPeer = node.getPeer();
+                Lock readLock = curPeer.getSatelliteStateLock().readLock();
+                readLock.lock();
+                try
+                {
+                    final SatelliteState satelliteState = curPeer.getSatelliteState();
+
+                    if (satelliteState != null)
+                    {
+                        final SatelliteState filterStates = new SatelliteState(satelliteState);
+
+                        // states are already complete, we remove all resource that are not interesting from
+                        // our clone
+                        Set<ResourceName> removeSet = new TreeSet<>();
+                        for (ResourceName rscName : filterStates.getResourceStates().keySet())
+                        {
+                            if (
+                                !(upperFilterResources.isEmpty() ||
+                                    upperFilterResources.contains(rscName.value))
+                            )
+                            {
+                                removeSet.add(rscName);
+                            }
+                        }
+                        removeSet.forEach(rscName -> filterStates.getResourceStates().remove(rscName));
+                        rscList.putSatelliteState(node.getName(), filterStates);
+                    }
+                }
+                finally
+                {
+                    readLock.unlock();
+                }
+            }
+        }
+
+        return rscList;
+    }
+
+    List<ResourceConnectionApi> listResourceConnections(final String rscNameString)
+    {
+        ResourceName rscName = null;
+        List<ResourceConnectionApi> rscConns = new ArrayList<>();
+        try
+        {
+            rscName = new ResourceName(rscNameString);
+            ResourceDefinition rscDfn = resourceDefinitionRepository.get(rscName);
+
+            if (rscDfn  != null)
+            {
+                final Map<ResourceConnectionKey, ResourceConnectionApi> rscConMap = new TreeMap<>();
+
+                // Build an array of all resources of the resource definition
+                Resource[] rscList = new Resource[rscDfn.getResourceCount()];
+                {
+                    Iterator<Resource> rscIter = rscDfn.iterateResource();
+                    for (int idx = 0; rscIter.hasNext(); ++idx)
+                    {
+                        rscList[idx] = rscIter.next();
+                    }
+                }
+
+                // Collect resource connection from all resources, avoiding duplicates
+                for (Resource rsc : rscList)
+                {
+                    List<ResourceConnection> rscConList = rsc.getAbsResourceConnections();
+                    for (ResourceConnection rscCon : rscConList)
+                    {
+                        ResourceConnectionKey rscConKey = new ResourceConnectionKey(
+                            rscCon.getSourceResource(), rscCon.getTargetResource()
+                        );
+                        if (!rscConMap.containsKey(rscConKey))
+                        {
+                            rscConMap.put(rscConKey, rscCon.getApiData());
+                        }
+                    }
+                }
+
+                // Construct empty resource connections for all resource pairs that did not have
+                // a resource connection defined already
+                for (int outerIdx = 0; outerIdx < rscList.length; ++outerIdx)
+                {
+                    for (int innerIdx = outerIdx + 1; innerIdx < rscList.length; ++innerIdx)
+                    {
+                        ResourceConnectionKey rscConKey = new ResourceConnectionKey(
+                            rscList[outerIdx], rscList[innerIdx]
+                        );
+                        if (!rscConMap.containsKey(rscConKey))
+                        {
+                            rscConMap.put(
+                                rscConKey,
+                                new RscConnPojo(
+                                    UUID.randomUUID(),
+                                    rscConKey.getSourceNodeName().getDisplayName(),
+                                    rscConKey.getTargetNodeName().getDisplayName(),
+                                    rscDfn.getName().getDisplayName(),
+                                    new HashMap<>(),
+                                    0,
+                                    null,
+                                    null
+                                )
+                            );
+                        }
+                    }
+                }
+
+                rscConns.addAll(rscConMap.values());
+            }
+            else
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_NOT_FOUND_RSC_DFN,
+                        String.format("Resource definition '%s' not found.", rscNameString)
+                    )
+                );
+            }
+        }
+        catch (InvalidNameException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_RSC_NAME,
+                    "Invalid resource name used"
+                ),
+            exc);
+        }
+
+        return rscConns;
+    }
+
+    public static String getRscDescription(Resource resource)
+    {
+        return getRscDescription(
+            resource.getNode().getName().displayValue, resource.getResourceDefinition().getName().displayValue);
+    }
+
+    public static String getRscDescription(String nodeNameStr, String rscNameStr)
+    {
+        return "Node: " + nodeNameStr + ", Resource: " + rscNameStr;
+    }
+
+    public static String getRscDescriptionInline(Resource rsc)
+    {
+        return getRscDescriptionInline(rsc.getNode(), rsc.getResourceDefinition());
+    }
+
+    public static String getRscDescriptionInline(Node node, ResourceDefinition rscDfn)
+    {
+        return getRscDescriptionInline(node.getName().displayValue, rscDfn.getName().displayValue);
+    }
+
+    public static String getRscDescriptionInline(String nodeNameStr, String rscNameStr)
+    {
+        return "resource '" + rscNameStr + "' on node '" + nodeNameStr + "'";
+    }
+
+    public static ResponseContext makeRscContext(
+        ApiOperation operation,
+        String nodeNameStr,
+        String rscNameStr
+    )
+    {
+        Map<String, String> objRefs = new TreeMap<>();
+        objRefs.put(ApiConsts.KEY_NODE, nodeNameStr);
+        objRefs.put(ApiConsts.KEY_RSC_DFN, rscNameStr);
+
+        return new ResponseContext(
+            operation,
+            getRscDescription(nodeNameStr, rscNameStr),
+            getRscDescriptionInline(nodeNameStr, rscNameStr),
+            ApiConsts.MASK_RSC,
+            objRefs
+        );
+    }
+}

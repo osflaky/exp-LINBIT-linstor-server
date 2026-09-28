@@ -1,0 +1,248 @@
+package com.linbit.linstor.core.apicallhandler.controller.internal;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.serializer.CtrlStltSerializer;
+import com.linbit.linstor.api.pojo.CapacityInfoPojo;
+import com.linbit.linstor.core.CoreModule;
+import com.linbit.linstor.core.CoreModule.NodesMap;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlApiDataLoader;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlStorPoolApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlTransactionHelper;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.identifier.StorPoolName;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.locks.LockGuard;
+
+import static com.linbit.linstor.core.apicallhandler.controller.helpers.StorPoolHelper.getStorPoolDescriptionInline;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Provider;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.locks.ReadWriteLock;
+
+public class StorPoolInternalCallHandler
+{
+    private final ErrorReporter errorReporter;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final ResponseConverter responseConverter;
+    private final CtrlStltSerializer ctrlStltSerializer;
+    private final Provider<Peer> peer;
+
+    private final ReadWriteLock nodesMapLock;
+    private final ReadWriteLock storPoolDfnMapLock;
+    private final NodesMap nodesMap;
+
+    @Inject
+    public StorPoolInternalCallHandler(
+        ErrorReporter errorReporterRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        ResponseConverter responseConverterRef,
+        CtrlStltSerializer ctrlStltSerializerRef,
+        Provider<Peer> peerRef,
+        @Named(CoreModule.NODES_MAP_LOCK) ReadWriteLock nodesMapLockRef,
+        @Named(CoreModule.STOR_POOL_DFN_MAP_LOCK) ReadWriteLock storPoolDfnMapLockRef,
+        NodesMap nodesMapRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        responseConverter = responseConverterRef;
+        ctrlStltSerializer = ctrlStltSerializerRef;
+        peer = peerRef;
+        nodesMapLock = nodesMapLockRef;
+        storPoolDfnMapLock = storPoolDfnMapLockRef;
+        nodesMap = nodesMapRef;
+    }
+
+    public void handleStorPoolRequest(UUID storPoolUuid, String nodeNameStr, String storPoolNameRef)
+    {
+        try (
+            LockGuard ls = LockGuard.createLocked(
+                nodesMapLock.readLock(),
+                storPoolDfnMapLock.readLock(),
+                peer.get().getSerializerLock().readLock()
+            )
+        )
+        {
+            NodeName nodeName = new NodeName(nodeNameStr);
+            StorPoolName storPoolName = new StorPoolName(storPoolNameRef);
+
+            Peer currentPeer = peer.get();
+            @Nullable Node node = nodesMap.get(nodeName);
+            @Nullable StorPool storPool;
+            if (node == null)
+            {
+                storPool = null;
+            }
+            else
+            {
+                storPool = node.getStorPool(storPoolName);
+            }
+
+            // TODO: check if the storPool has the same uuid as storPoolUuid
+            if (storPool != null)
+            {
+                long fullSyncTimestamp = currentPeer.getFullSyncId();
+                long updateId = currentPeer.getNextSerializerId();
+                currentPeer.sendMessage(
+                    ctrlStltSerializer
+                        .onewayBuilder(InternalApiConsts.API_APPLY_STOR_POOL)
+                        .storPool(storPool, fullSyncTimestamp, updateId)
+                        .build()
+                );
+            }
+            else
+            {
+                long fullSyncTimestamp = currentPeer.getFullSyncId();
+                long updateId = currentPeer.getNextSerializerId();
+                currentPeer.sendMessage(
+                    ctrlStltSerializer
+                        .onewayBuilder(InternalApiConsts.API_APPLY_STOR_POOL_DELETED)
+                        .deletedStorPool(nodeNameStr, storPoolNameRef, fullSyncTimestamp, updateId)
+                        .build()
+                );
+            }
+        }
+        catch (InvalidNameException invalidNameExc)
+        {
+            errorReporter.reportError(
+                new ImplementationError(
+                    "Satellite requested data for invalid storpool name '" + storPoolNameRef + "' for node '" +
+                        nodeNameStr + "'.",
+                    invalidNameExc
+                )
+            );
+        }
+    }
+
+    private void setCapacityInfo(StorPool storPool, long freeCapacity, long totalCapacity)
+    {
+        storPool.getFreeSpaceTracker().setCapacityInfo(freeCapacity, totalCapacity);
+    }
+
+    public void updateRealFreeSpace(List<CapacityInfoPojo> capacityInfoPojoList)
+    {
+        updateRealFreeSpace(peer.get(), capacityInfoPojoList);
+    }
+
+    public void updateRealFreeSpace(Peer peerRef, List<CapacityInfoPojo> capacityInfoPojoList)
+    {
+        try (LockGuard ls = LockGuard.createLocked(nodesMapLock.writeLock(), storPoolDfnMapLock.writeLock()))
+        {
+            Node node = peerRef.getNode();
+            if (!node.isDeleted())
+            {
+                String nodeName = node.getName().displayValue;
+
+                try
+                {
+                    for (CapacityInfoPojo capacityInfoPojo : capacityInfoPojoList)
+                    {
+                        ResponseContext context = CtrlStorPoolApiCallHandler.makeStorPoolContext(
+                            ApiOperation.makeModifyOperation(),
+                            nodeName,
+                            capacityInfoPojo.getStorPoolName()
+                        );
+
+                        try
+                        {
+                            StorPool storPool = ctrlApiDataLoader.loadStorPool(
+                                capacityInfoPojo.getStorPoolName(),
+                                node
+                            );
+                            if (storPool.getUuid().equals(capacityInfoPojo.getStorPoolUuid()))
+                            {
+                                storPool.clearReports();
+                                storPool.addReports(capacityInfoPojo.getErrors());
+                                setCapacityInfo(
+                                    storPool,
+                                    capacityInfoPojo.getFreeCapacity(),
+                                    capacityInfoPojo.getTotalCapacity()
+                                );
+                            }
+                            else
+                            {
+                                throw new ApiRcException(ApiCallRcImpl.simpleEntry(
+                                    ApiConsts.FAIL_UUID_STOR_POOL,
+                                    "UUIDs mismatched when updating free space of " +
+                                        getStorPoolDescriptionInline(storPool) + ".\nLocal UUID: " + storPool
+                                            .getUuid() + ", UUID from pojo: " + capacityInfoPojo.getStorPoolUuid()
+                                ));
+                            }
+                        }
+                        catch (Exception | ImplementationError exc)
+                        {
+                            // Add context to exception
+                            throw new ApiRcException(
+                                responseConverter.exceptionToResponse(peerRef, context, exc), exc, true);
+                        }
+                    }
+
+                    ctrlTransactionHelper.commit();
+                }
+                catch (ApiRcException exc)
+                {
+                    ApiCallRc apiCallRc = exc.getApiCallRc();
+                    for (ApiCallRc.RcEntry entry : apiCallRc)
+                    {
+                        errorReporter.reportError(
+                            exc.getCause() != null ? exc.getCause() : exc,
+                            peerRef,
+                            entry.getMessage()
+                        );
+                    }
+                }
+            }
+        }
+        // else: the node is deleted, thus if it still has any storpools left, those will
+        // soon be deleted as well.
+    }
+
+    public void handleStorPoolApplied(
+        String storPoolNameRef,
+        boolean supportsSnapshotsRef,
+        CapacityInfoPojo capacityInfoPojoRef
+    )
+    {
+        Peer currentPeer = peer.get();
+        @Nullable StorPool storPool = null;
+        try
+        {
+            @Nullable Node node = currentPeer.getNode();
+            if (node != null && !node.isDeleted())
+            {
+                storPool = node.getStorPool(new StorPoolName(storPoolNameRef));
+                if (storPool != null && !storPool.isDeleted())
+                {
+                    storPool.setSupportsSnapshot(supportsSnapshotsRef);
+                    updateRealFreeSpace(currentPeer, Collections.singletonList(capacityInfoPojoRef));
+                }
+            }
+        }
+        catch (InvalidNameException | DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+}

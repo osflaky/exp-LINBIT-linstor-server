@@ -1,0 +1,355 @@
+package com.linbit.linstor.core.objects;
+
+import com.linbit.InvalidIpAddressException;
+import com.linbit.InvalidNameException;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.core.identifier.ResourceGroupName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.VolumeNumber;
+import com.linbit.linstor.dbdrivers.AbsDatabaseDriver;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.dbdrivers.DatabaseLoader;
+import com.linbit.linstor.dbdrivers.DbEngine;
+import com.linbit.linstor.dbdrivers.GeneratedDatabaseTables;
+import com.linbit.linstor.dbdrivers.RawParameters;
+import com.linbit.linstor.dbdrivers.interfaces.ResourceGroupCtrlDatabaseDriver;
+import com.linbit.linstor.dbdrivers.interfaces.updater.CollectionDatabaseDriver;
+import com.linbit.linstor.dbdrivers.interfaces.updater.MapDatabaseDriver;
+import com.linbit.linstor.dbdrivers.interfaces.updater.SingleColumnDatabaseDriver;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.propscon.PropsContainerFactory;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.kinds.DeviceProviderKind;
+import com.linbit.linstor.transaction.TransactionObjectFactory;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+import com.linbit.utils.Pair;
+
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.ALLOWED_PROVIDER_LIST;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.DESCRIPTION;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.DISKLESS_ON_REMAINING;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.DO_NOT_PLACE_WITH_RSC_LIST;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.DO_NOT_PLACE_WITH_RSC_REGEX;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.LAYER_STACK;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.NODE_NAME_LIST;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.PEER_SLOTS;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.POOL_NAME;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.POOL_NAME_DISKLESS;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.REPLICAS_ON_DIFFERENT;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.REPLICAS_ON_SAME;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.REPLICA_COUNT;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.RESOURCE_GROUP_DSP_NAME;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.RESOURCE_GROUP_NAME;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.UUID;
+import static com.linbit.linstor.dbdrivers.GeneratedDatabaseTables.ResourceGroups.X_REPLICAS_ON_DIFFERENT;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.function.Function;
+
+@Singleton
+public final class ResourceGroupDbDriver
+    extends AbsDatabaseDriver<ResourceGroup, ResourceGroup.InitMaps, Void>
+    implements ResourceGroupCtrlDatabaseDriver
+{
+    private final PropsContainerFactory propsContainerFactory;
+    private final TransactionObjectFactory transObjFactory;
+
+    private final SingleColumnDatabaseDriver<ResourceGroup, String> descriptionDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, DeviceLayerKind> layerStackDriver;
+    private final SingleColumnDatabaseDriver<ResourceGroup, Integer> replicaCountDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> nodeNameDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> storPoolNameDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> storPoolDisklessNameDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> doNotPlaceWithRscListDriver;
+    private final SingleColumnDatabaseDriver<ResourceGroup, String> doNotPlaceWithRscRegexDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> replicasOnSameListDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, String> replicasOnDifferentListDriver;
+    private final MapDatabaseDriver<ResourceGroup, String, Integer> xReplicasOnDifferentMapDriver;
+    private final CollectionDatabaseDriver<ResourceGroup, DeviceProviderKind> allowedProviderListDriver;
+    private final SingleColumnDatabaseDriver<ResourceGroup, Boolean> disklessOnRemainingDriver;
+    private final SingleColumnDatabaseDriver<ResourceGroup, Short> peerSlotsDriver;
+    private final Provider<TransactionMgr> transMgrProvider;
+
+    @Inject
+    public ResourceGroupDbDriver(
+        ErrorReporter errorReporterRef,
+        DbEngine dbEngine,
+        PropsContainerFactory propsContainerFactoryRef,
+        TransactionObjectFactory transObjFactoryRef,
+        Provider<TransactionMgr> transMgrProviderRef
+    )
+    {
+        super(
+            errorReporterRef,
+            GeneratedDatabaseTables.RESOURCE_GROUPS,
+            dbEngine
+        );
+        propsContainerFactory = propsContainerFactoryRef;
+        transObjFactory = transObjFactoryRef;
+        transMgrProvider = transMgrProviderRef;
+
+        setColumnSetter(UUID, rscGrp -> rscGrp.getUuid().toString());
+        setColumnSetter(RESOURCE_GROUP_NAME, rscGrp -> rscGrp.getName().value);
+        setColumnSetter(RESOURCE_GROUP_DSP_NAME, rscGrp -> rscGrp.getName().displayValue);
+        setColumnSetter(DESCRIPTION, rscGrp -> rscGrp.getDescription());
+        setColumnSetter(
+            LAYER_STACK,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getLayerStackList())
+        );
+        setColumnSetter(REPLICA_COUNT, rscGrp -> rscGrp.getAutoPlaceConfig().getReplicaCount());
+        setColumnSetter(NODE_NAME_LIST, rscGrp -> toString(rscGrp.getAutoPlaceConfig().getNodeNameList()));
+        setColumnSetter(POOL_NAME, rscGrp -> toString(rscGrp.getAutoPlaceConfig().getStorPoolNameList()));
+        setColumnSetter(
+            POOL_NAME_DISKLESS,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getStorPoolDisklessNameList())
+        );
+        setColumnSetter(
+            DO_NOT_PLACE_WITH_RSC_REGEX,
+            rscGrp -> rscGrp.getAutoPlaceConfig().getDoNotPlaceWithRscRegex()
+        );
+        setColumnSetter(
+            DO_NOT_PLACE_WITH_RSC_LIST,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getDoNotPlaceWithRscList())
+        );
+        setColumnSetter(
+            ALLOWED_PROVIDER_LIST,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getProviderList())
+        );
+        setColumnSetter(
+            DISKLESS_ON_REMAINING,
+            rscGrp -> rscGrp.getAutoPlaceConfig().getDisklessOnRemaining()
+        );
+        setColumnSetter(
+            REPLICAS_ON_SAME,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getReplicasOnSameList())
+        );
+        setColumnSetter(
+            REPLICAS_ON_DIFFERENT,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getReplicasOnDifferentList())
+        );
+        setColumnSetter(
+            X_REPLICAS_ON_DIFFERENT,
+            rscGrp -> toString(rscGrp.getAutoPlaceConfig().getXReplicasOnDifferentMap())
+        );
+        setColumnSetter(
+            PEER_SLOTS,
+            rscGrp -> rscGrp.getPeerSlots()
+        );
+
+        descriptionDriver = generateSingleColumnDriver(
+            DESCRIPTION,
+            rscGrp -> rscGrp.getDescription(),
+            Function.identity()
+        );
+        layerStackDriver = generateCollectionToJsonStringArrayDriver(LAYER_STACK);
+        replicaCountDriver = generateSingleColumnDriver(
+            REPLICA_COUNT,
+            rscGrp -> Objects.toString(rscGrp.getAutoPlaceConfig().getReplicaCount()),
+            Function.identity()
+        );
+        nodeNameDriver = generateCollectionToJsonStringArrayDriver(NODE_NAME_LIST);
+        storPoolNameDriver = generateCollectionToJsonStringArrayDriver(POOL_NAME);
+        storPoolDisklessNameDriver = generateCollectionToJsonStringArrayDriver(POOL_NAME_DISKLESS);
+        doNotPlaceWithRscListDriver = generateCollectionToJsonStringArrayDriver(DO_NOT_PLACE_WITH_RSC_LIST);
+        doNotPlaceWithRscRegexDriver = generateSingleColumnDriver(
+            DO_NOT_PLACE_WITH_RSC_REGEX,
+            rscGrp -> Objects.toString(rscGrp.getAutoPlaceConfig().getDoNotPlaceWithRscRegex()),
+            Function.identity()
+        );
+        replicasOnSameListDriver = generateCollectionToJsonStringArrayDriver(REPLICAS_ON_SAME);
+        replicasOnDifferentListDriver = generateCollectionToJsonStringArrayDriver(REPLICAS_ON_DIFFERENT);
+        xReplicasOnDifferentMapDriver = generateMapToJsonStringArrayDriver(X_REPLICAS_ON_DIFFERENT);
+        allowedProviderListDriver = generateCollectionToJsonStringArrayDriver(ALLOWED_PROVIDER_LIST);
+        disklessOnRemainingDriver = generateSingleColumnDriver(
+            DISKLESS_ON_REMAINING,
+            rscGrp -> Objects.toString(rscGrp.getAutoPlaceConfig().getDisklessOnRemaining()),
+            Function.identity()
+        );
+        peerSlotsDriver = generateSingleColumnDriver(
+            PEER_SLOTS,
+            rscGrp -> Objects.toString(rscGrp.getPeerSlots()),
+            Function.identity()
+        );
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<ResourceGroup, String> getDescriptionDriver()
+    {
+        return descriptionDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, DeviceLayerKind> getLayerStackDriver()
+    {
+        return layerStackDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<ResourceGroup, Integer> getReplicaCountDriver()
+    {
+        return replicaCountDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getNodeNameDriver()
+    {
+        return nodeNameDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getStorPoolNameDriver()
+    {
+        return storPoolNameDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getStorPoolDisklessNameDriver()
+    {
+        return storPoolDisklessNameDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getDoNotPlaceWithRscListDriver()
+    {
+        return doNotPlaceWithRscListDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<ResourceGroup, String> getDoNotPlaceWithRscRegexDriver()
+    {
+        return doNotPlaceWithRscRegexDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getReplicasOnSameListDriver()
+    {
+        return replicasOnSameListDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, String> getReplicasOnDifferentDriver()
+    {
+        return replicasOnDifferentListDriver;
+    }
+
+    @Override
+    public MapDatabaseDriver<ResourceGroup, String, Integer> getXReplicasOnDifferentMapDriver()
+    {
+        return xReplicasOnDifferentMapDriver;
+    }
+
+    @Override
+    public CollectionDatabaseDriver<ResourceGroup, DeviceProviderKind> getAllowedProviderListDriver()
+    {
+        return allowedProviderListDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<ResourceGroup, Boolean> getDisklessOnRemainingDriver()
+    {
+        return disklessOnRemainingDriver;
+    }
+
+    @Override
+    public SingleColumnDatabaseDriver<ResourceGroup, Short> getPeerSlotsDriver()
+    {
+        return peerSlotsDriver;
+    }
+
+    @Override
+    protected Pair<ResourceGroup, ResourceGroup.InitMaps> load(
+        RawParameters raw,
+        Void loadAllDataRef
+    )
+        throws DatabaseException, InvalidNameException, InvalidIpAddressException, ValueOutOfRangeException
+    {
+        ResourceGroupName rscGrpName = raw.build(RESOURCE_GROUP_DSP_NAME, ResourceGroupName::new);
+        Map<VolumeNumber, VolumeGroup> vlmGrpMap = new TreeMap<>();
+        Map<ResourceName, ResourceDefinition> rscDfnMap = new TreeMap<>();
+
+        final @Nullable Integer replicaCount;
+        final @Nullable List<String> replicasOnSame;
+        final @Nullable List<String> replicasOnDifferentList;
+        final @Nullable Map<String, Integer> xReplicasOnDifferentMap;
+        final @Nullable Boolean disklessOnRemaining;
+        final @Nullable Short peerSlots;
+
+        replicaCount = raw.get(REPLICA_COUNT);
+
+        replicasOnSame = raw.getAsStringListNonNull(REPLICAS_ON_SAME);
+        replicasOnDifferentList = raw.getAsStringListNonNull(REPLICAS_ON_DIFFERENT);
+        xReplicasOnDifferentMap = raw.getAsStringIntegerMapNonNull(X_REPLICAS_ON_DIFFERENT);
+
+        disklessOnRemaining = raw.get(DISKLESS_ON_REMAINING);
+        peerSlots = raw.get(PEER_SLOTS);
+
+        return new Pair<>(
+            new ResourceGroup(
+                raw.build(UUID, java.util.UUID::fromString),
+                rscGrpName,
+                raw.get(DESCRIPTION),
+                DatabaseLoader.asDevLayerKindList(raw.getAsStringListNonNull(LAYER_STACK)),
+                replicaCount,
+                raw.getAsStringList(NODE_NAME_LIST),
+                raw.getAsStringList(POOL_NAME),
+                raw.getAsStringList(POOL_NAME_DISKLESS),
+                raw.getAsStringList(DO_NOT_PLACE_WITH_RSC_LIST),
+                raw.get(DO_NOT_PLACE_WITH_RSC_REGEX),
+                replicasOnSame,
+                replicasOnDifferentList,
+                xReplicasOnDifferentMap,
+                DatabaseLoader.asDevLayerProviderList(raw.getAsStringList(ALLOWED_PROVIDER_LIST)),
+                disklessOnRemaining,
+                vlmGrpMap,
+                rscDfnMap,
+                peerSlots,
+                this,
+                propsContainerFactory,
+                transObjFactory,
+                transMgrProvider
+            ),
+            new RscGrpInitMapsImpl(vlmGrpMap, rscDfnMap)
+        );
+    }
+
+    @Override
+    protected String getId(ResourceGroup rscGrp)
+    {
+        return "(RscGrpName=" + rscGrp.getName().displayValue + ")";
+    }
+
+    private static class RscGrpInitMapsImpl implements ResourceGroup.InitMaps
+    {
+        private final Map<VolumeNumber, VolumeGroup> vlmGrpMap;
+        private final Map<ResourceName, ResourceDefinition> rscDfnMap;
+
+        RscGrpInitMapsImpl(
+            Map<VolumeNumber, VolumeGroup> vlmGrpMapRef,
+            Map<ResourceName, ResourceDefinition> rscDfnMapRef
+        )
+        {
+            vlmGrpMap = vlmGrpMapRef;
+            rscDfnMap = rscDfnMapRef;
+        }
+
+        @Override
+        public Map<VolumeNumber, VolumeGroup> getVlmGrpMap()
+        {
+            return vlmGrpMap;
+        }
+
+        @Override
+        public Map<ResourceName, ResourceDefinition> getRscDfnMap()
+        {
+            return rscDfnMap;
+        }
+
+    }
+}

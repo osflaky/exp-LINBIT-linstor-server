@@ -1,0 +1,172 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.core.CoreModule;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.apicallhandler.response.OperationDescription;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.objects.ResourceConnection;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.locks.LockGuard;
+
+import static com.linbit.linstor.core.apicallhandler.controller.CtrlRscConnectionApiCallHandler.getResourceConnectionDescriptionInline;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Singleton;
+
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.locks.ReadWriteLock;
+
+import reactor.core.publisher.Flux;
+
+@Singleton
+public class CtrlDrbdProxyEnableApiCallHandler
+{
+    private final ErrorReporter errorReporter;
+    private final ScopeRunner scopeRunner;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final ResponseConverter responseConverter;
+    private final ReadWriteLock nodesMapLock;
+    private final ReadWriteLock rscDfnMapLock;
+    private final CtrlDrbdProxyHelper drbdProxyHelper;
+
+    @Inject
+    public CtrlDrbdProxyEnableApiCallHandler(
+        ScopeRunner scopeRunnerRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        ResponseConverter responseConverterRef,
+        @Named(CoreModule.NODES_MAP_LOCK) ReadWriteLock nodesMapLockRef,
+        @Named(CoreModule.RSC_DFN_MAP_LOCK) ReadWriteLock rscDfnMapLockRef,
+        CtrlDrbdProxyHelper drbdProxyHelperRef,
+        ErrorReporter errorReporterRef
+    )
+    {
+        scopeRunner = scopeRunnerRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        responseConverter = responseConverterRef;
+        nodesMapLock = nodesMapLockRef;
+        rscDfnMapLock = rscDfnMapLockRef;
+        drbdProxyHelper = drbdProxyHelperRef;
+        errorReporter = errorReporterRef;
+    }
+
+    public Flux<ApiCallRc> enableProxy(
+        @Nullable UUID rscConnUuid,
+        String nodeName1,
+        String nodeName2,
+        String rscNameStr,
+        @Nullable Integer drbdProxyPortSrc,
+        @Nullable Integer drbdProxyPortTarget
+    )
+    {
+        ResponseContext context = makeDrbdProxyContext(
+            new ApiOperation(ApiConsts.MASK_MOD,
+                new OperationDescription("enabling", "enabling")),
+            nodeName1,
+            nodeName2,
+            rscNameStr
+        );
+
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Enable proxy",
+                LockGuard.createDeferred(
+                    nodesMapLock.writeLock(),
+                    rscDfnMapLock.writeLock()
+                ),
+                () -> enableProxyInTransaction(
+                    rscConnUuid,
+                    nodeName1,
+                    nodeName2,
+                    rscNameStr,
+                    drbdProxyPortSrc,
+                    drbdProxyPortTarget
+                )
+            )
+            .transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> enableProxyInTransaction(
+        @Nullable UUID rscConnUuid,
+        String nodeName1,
+        String nodeName2,
+        String rscNameStr,
+        @Nullable Integer drbdProxyPortSrc,
+        @Nullable Integer drbdProxyPortTarget
+    )
+    {
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+
+        ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscNameStr);
+
+        ResourceConnection rscConn = drbdProxyHelper.enableProxy(
+            rscConnUuid,
+            nodeName1,
+            nodeName2,
+            rscNameStr,
+            drbdProxyPortSrc,
+            drbdProxyPortTarget
+        );
+
+        ctrlTransactionHelper.commit();
+
+        Flux<ApiCallRc> satelliteUpdateResponses = ctrlSatelliteUpdateCaller.updateSatellites(rscDfn, Flux.empty())
+            .transform(updateResponses -> CtrlResponseUtils.combineResponses(
+                errorReporter,
+                updateResponses,
+                rscDfn.getName(),
+                "Notified {0} of proxy connection for {1}"
+            ));
+
+        responses.addEntry(ApiCallRcImpl.simpleEntry(
+            ApiConsts.MODIFIED,
+            "DRBD Proxy enabled on " + getResourceConnectionDescriptionInline(rscConn)
+        ));
+
+        return Flux
+            .<ApiCallRc>just(responses)
+            .concatWith(satelliteUpdateResponses)
+            .onErrorResume(CtrlResponseUtils.DelayedApiRcException.class, ignored -> Flux.empty());
+    }
+
+    static ResponseContext makeDrbdProxyContext(
+        ApiOperation operation,
+        String nodeName1Str,
+        String nodeName2Str,
+        String rscNameStr
+    )
+    {
+        Map<String, String> objRefs = new TreeMap<>();
+        objRefs.put(ApiConsts.KEY_1ST_NODE, nodeName1Str);
+        objRefs.put(ApiConsts.KEY_2ND_NODE, nodeName2Str);
+        objRefs.put(ApiConsts.KEY_RSC_DFN, rscNameStr);
+
+        String objectDescription =
+            "DRBD Proxy on " + getResourceConnectionDescriptionInline(nodeName1Str, nodeName2Str, rscNameStr);
+
+        return new ResponseContext(
+            operation,
+            objectDescription,
+            objectDescription,
+            ApiConsts.MASK_RSC_CONN,
+            objRefs
+        );
+    }
+}

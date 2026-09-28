@@ -1,0 +1,263 @@
+package com.linbit.linstor.core.apicallhandler;
+
+import com.linbit.ImplementationError;
+import com.linbit.extproc.ExtCmdFactory;
+import com.linbit.linstor.LinStorException;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.DecryptionHelper;
+import com.linbit.linstor.core.ControllerPeerConnector;
+import com.linbit.linstor.core.CoreModule;
+import com.linbit.linstor.core.CoreModule.ResourceDefinitionMap;
+import com.linbit.linstor.core.DeviceManager;
+import com.linbit.linstor.core.StltSecurityObjects;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.StorPoolName;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.layer.storage.utils.SEDUtils;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.storage.data.adapter.luks.LuksVlmData;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.storage.interfaces.categories.resource.VlmProviderObject;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.kinds.DeviceProviderKind;
+import com.linbit.linstor.storage.utils.LayerUtils;
+import com.linbit.linstor.transaction.TransactionException;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+
+@Singleton
+public class StltCryptApiCallHelper
+{
+    private final Provider<TransactionMgr> transMgrProvider;
+    private final StltSecurityObjects secObjs;
+    private final ResourceDefinitionMap rscDfnMap;
+    private final DeviceManager devMgr;
+    private final DecryptionHelper decryptionHelper;
+    private final ControllerPeerConnector controllerPeerConnector;
+    private final ErrorReporter errorReporter;
+    private final ExtCmdFactory extCmdFactory;
+
+    @Inject
+    StltCryptApiCallHelper(
+        CoreModule.ResourceDefinitionMap rscDfnMapRef,
+        Provider<TransactionMgr> transMgrProviderRef,
+        StltSecurityObjects secObjsRef,
+        DeviceManager devMgrRef,
+        DecryptionHelper decryptionHelperRef,
+        ControllerPeerConnector controllerPeerConnectorRef,
+        ErrorReporter errorReporterRef,
+        ExtCmdFactory extCmdFactoryRef
+    )
+    {
+        rscDfnMap = rscDfnMapRef;
+        transMgrProvider = transMgrProviderRef;
+        secObjs = secObjsRef;
+        devMgr = devMgrRef;
+        decryptionHelper = decryptionHelperRef;
+        controllerPeerConnector = controllerPeerConnectorRef;
+        errorReporter = errorReporterRef;
+        extCmdFactory = extCmdFactoryRef;
+    }
+
+    private Set<ResourceName> findResourcesUsingStorPool(StorPoolName storPoolName)
+    {
+        final Set<ResourceName> resources = new TreeSet<>();
+        for (ResourceDefinition rscDfn : rscDfnMap.values())
+        {
+            Iterator<Resource> rscIt = rscDfn.iterateResource();
+            while (rscIt.hasNext())
+            {
+                Resource rsc = rscIt.next();
+
+                AbsRscLayerObject<Resource> layerData = rsc.getLayerData();
+                List<AbsRscLayerObject<Resource>> rscDataList = LayerUtils.getChildLayerDataByKind(
+                    layerData,
+                    DeviceLayerKind.STORAGE
+                );
+
+                for (AbsRscLayerObject<Resource> rscData : rscDataList)
+                {
+                    for (VlmProviderObject<Resource> vlmData : rscData.getVlmLayerObjects().values())
+                    {
+                        if (vlmData.getStorPool().getName().equals(storPoolName))
+                        {
+                            resources.add(rscDfn.getName());
+                        }
+                    }
+                }
+            }
+        }
+        return resources;
+    }
+
+    private Set<ResourceName> decryptSEDDrives(final byte[] masterKey) throws LinStorException
+    {
+        final Set<ResourceName> updateResources = new TreeSet<>();
+        Node localNode = controllerPeerConnector.getLocalNode();
+        Iterator<StorPool> itStorPool = localNode.iterateStorPools();
+        while (itStorPool.hasNext())
+        {
+            StorPool sp = itStorPool.next();
+            @Nullable Props sedNS = sp.getProps().getNamespace(ApiConsts.NAMESPC_SED);
+            // SED namespace contains drives as keys with their password as value
+            if (sedNS != null)
+            {
+                Map<String, String> sedMap = SEDUtils.drivePasswordMap(sedNS.cloneMap());
+                for (final String drive : sedMap.keySet())
+                {
+                    String sedEncPassword = sedMap.get(drive);
+                    String sedPassword = decryptionHelper.decryptB64ToString(masterKey, sedEncPassword);
+                    String realPath = SEDUtils.realpath(errorReporter, drive);
+                    SEDUtils.unlockSED(extCmdFactory, errorReporter, realPath, sedPassword);
+                }
+
+                updateResources.addAll(findResourcesUsingStorPool(sp.getName()));
+            }
+        }
+        return updateResources;
+    }
+
+    private Set<ResourceName> decryptLuksVlmKeys(final byte[] masterKey)
+    {
+        final Set<ResourceName> decryptedResources = new TreeSet<>();
+        for (ResourceDefinition rscDfn : rscDfnMap.values())
+        {
+            Iterator<Resource> rscIt = rscDfn.iterateResource();
+            while (rscIt.hasNext())
+            {
+                Resource rsc = rscIt.next();
+                boolean success = decryptLuksKey(masterKey, rsc);
+                if (success)
+                {
+                    decryptedResources.add(rscDfn.getName());
+                }
+            }
+        }
+        return decryptedResources;
+    }
+
+    /**
+     * Returns true iff all LUKS keys of all volumes of the given resource could be decrypted.
+     */
+    private boolean decryptLuksKey(final byte[] masterKey, Resource rsc)
+    {
+        boolean success = true;
+        AbsRscLayerObject<Resource> layerData = rsc.getLayerData();
+        List<AbsRscLayerObject<Resource>> rscDataList = LayerUtils.getChildLayerDataByKind(
+            layerData,
+            DeviceLayerKind.LUKS
+        );
+        boolean reactivate = rsc.getStateFlags().isSet(Resource.Flags.REACTIVATE);
+        for (AbsRscLayerObject<Resource> rscData : rscDataList)
+        {
+            for (VlmProviderObject<Resource> vlmData : rscData.getVlmLayerObjects().values())
+            {
+                LuksVlmData<Resource> cryptVlmData = (LuksVlmData<Resource>) vlmData;
+                try
+                {
+                    if (reactivate || cryptVlmData.getDecryptedPassword() == null)
+                    {
+                        byte[] encryptedKey = cryptVlmData.getEncryptedKey();
+                        byte[] decryptedKey = decryptionHelper.decrypt(masterKey, encryptedKey);
+
+                        cryptVlmData.setDecryptedPassword(decryptedKey);
+                    }
+                }
+                catch (LinStorException exc)
+                {
+                    errorReporter.logError(
+                        "Unable to decrypt luks layer key with master key for %s/%d",
+                        rsc,
+                        vlmData.getVlmNr().value
+                    );
+                    errorReporter.reportError(exc);
+                    cryptVlmData.setCorruptedKey(true);
+                    success = false;
+                }
+            }
+        }
+        return success;
+    }
+
+    /**
+     * Although this method does not decrypt anything (decryption is done in the EBS Providers), we sill want to include
+     * the EBS resources in the next deviceManager run
+     *
+     */
+    private Collection<? extends ResourceName> getAllEBSResources()
+    {
+        Set<ResourceName> resourcesToProcess = new HashSet<>();
+        for (ResourceDefinition rscDfn : rscDfnMap.values())
+        {
+            Iterator<Resource> rscIt = rscDfn.iterateResource();
+            while (rscIt.hasNext())
+            {
+
+                Resource rsc = rscIt.next();
+                AbsRscLayerObject<Resource> layerData = rsc.getLayerData();
+                // also add EBS resources to the new devMgr run
+                List<AbsRscLayerObject<Resource>> storRscData = LayerUtils.getChildLayerDataByKind(
+                    layerData,
+                    DeviceLayerKind.STORAGE
+                );
+                for (AbsRscLayerObject<Resource> rscData : storRscData)
+                {
+                    for (VlmProviderObject<Resource> vlmData : rscData.getVlmLayerObjects().values())
+                    {
+                        DeviceProviderKind deviceProviderKind = vlmData.getStorPool().getDeviceProviderKind();
+                        if (deviceProviderKind.equals(DeviceProviderKind.EBS_INIT) ||
+                            deviceProviderKind.equals(DeviceProviderKind.EBS_TARGET))
+                        {
+                            resourcesToProcess.add(rscDfn.getName());
+                        }
+                    }
+                }
+            }
+        }
+        return resourcesToProcess;
+    }
+
+    public void decryptVolumesAndDrives(boolean updateDevMgr)
+    {
+        try
+        {
+            byte[] masterKey = secObjs.getCryptKey();
+
+            if (masterKey != null)
+            {
+                final Set<ResourceName> decryptedResources = new TreeSet<>();
+
+                decryptedResources.addAll(decryptSEDDrives(masterKey));
+                decryptedResources.addAll(decryptLuksVlmKeys(masterKey));
+                decryptedResources.addAll(getAllEBSResources());
+
+                transMgrProvider.get().commit();
+                if (updateDevMgr)
+                {
+                    devMgr.forceWakeUpdateNotifications();
+                    devMgr.markMultipleResourcesForDispatch(decryptedResources);
+                }
+            }
+        }
+        catch (LinStorException | TransactionException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+}

@@ -1,0 +1,625 @@
+package com.linbit.linstor.storage.data.adapter.drbd;
+
+import com.linbit.ExhaustedPoolException;
+import com.linbit.ImplementationError;
+import com.linbit.ValueInUseException;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.RscLayerDataApi;
+import com.linbit.linstor.api.pojo.DrbdRscPojo;
+import com.linbit.linstor.api.pojo.DrbdRscPojo.DrbdVlmPojo;
+import com.linbit.linstor.core.identifier.VolumeNumber;
+import com.linbit.linstor.core.objects.AbsResource;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.types.NodeId;
+import com.linbit.linstor.core.types.TcpPortNumber;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.dbdrivers.interfaces.LayerDrbdRscDatabaseDriver;
+import com.linbit.linstor.dbdrivers.interfaces.LayerDrbdVlmDatabaseDriver;
+import com.linbit.linstor.numberpool.DynamicNumberPool;
+import com.linbit.linstor.propscon.ReadOnlyProps;
+import com.linbit.linstor.stateflags.StateFlags;
+import com.linbit.linstor.storage.data.AbsRscData;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.storage.interfaces.layers.drbd.DrbdRscObject;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.transaction.TransactionObjectFactory;
+import com.linbit.linstor.transaction.TransactionSet;
+import com.linbit.linstor.transaction.TransactionSimpleObject;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+import com.linbit.linstor.utils.layer.LayerVlmUtils;
+
+import jakarta.inject.Provider;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
+
+public class DrbdRscData<RSC extends AbsResource<RSC>>
+    extends AbsRscData<RSC, DrbdVlmData<RSC>>
+    implements DrbdRscObject<RSC>
+{
+    // unmodifiable data, once initialized
+    private final DrbdRscDfnData<RSC> drbdRscDfnData;
+    private final TransactionSimpleObject<DrbdRscData<?>, NodeId> nodeId;
+    private final short peerSlots;
+    private final int alStripes;
+    private final long alStripeSize;
+    private final LayerDrbdRscDatabaseDriver drbdRscDbDriver;
+    private final LayerDrbdVlmDatabaseDriver drbdVlmDbDriver;
+    private final DynamicNumberPool tcpPortPool;
+
+    // persisted, serialized
+    private final StateFlags<DrbdRscFlags> flags;
+    /** non-empty for Resources, empty for Snapshots */
+    private final TransactionSet<DrbdRscData<?>, TcpPortNumber> rscPorts;
+    /** null for Resources, non-null for Snapshots */
+    private final TransactionSimpleObject<DrbdRscData<?>, @Nullable Integer> snapPortCount;
+
+    // not persisted, serialized
+    private @Nullable Integer promotionScore = null;
+    private @Nullable Boolean mayPromote = null;
+
+    // not persisted, not serialized, stlt only
+    private boolean requiresAdjust = false;
+    private boolean exists = false;
+    private boolean failed = false;
+    private boolean isPrimary;
+    private boolean isSuspended = false;
+
+    public DrbdRscData(
+        int rscLayerIdRef,
+        RSC rscRef,
+        @Nullable AbsRscLayerObject<RSC> parentRef,
+        DrbdRscDfnData<RSC> drbdRscDfnDataRef,
+        Set<AbsRscLayerObject<RSC>> childrenRef,
+        Map<VolumeNumber, DrbdVlmData<RSC>> vlmLayerObjectsMapRef,
+        String rscNameSuffixRef,
+        NodeId nodeIdRef,
+        @Nullable Collection<TcpPortNumber> portListRef,
+        @Nullable Integer portCountRef,
+        @Nullable Short peerSlotsRef,
+        @Nullable Integer alStripesRef,
+        @Nullable Long alStripeSizeRef,
+        long initFlags,
+        DynamicNumberPool tcpPortPoolRef,
+        LayerDrbdRscDatabaseDriver drbdRscDbDriverRef,
+        LayerDrbdVlmDatabaseDriver drbdVlmDbDriverRef,
+        TransactionObjectFactory transObjFactory,
+        Provider<? extends TransactionMgr> transMgrProvider
+    )
+        throws ValueOutOfRangeException, ExhaustedPoolException, ValueInUseException
+    {
+        super(
+            rscLayerIdRef,
+            rscRef,
+            parentRef,
+            childrenRef,
+            rscNameSuffixRef,
+            drbdRscDbDriverRef.getIdDriver(),
+            vlmLayerObjectsMapRef,
+            transObjFactory,
+            transMgrProvider
+        );
+
+        nodeId = transObjFactory.createTransactionSimpleObject(this, nodeIdRef, drbdRscDbDriverRef.getNodeIdDriver());
+        drbdRscDbDriver = drbdRscDbDriverRef;
+        drbdVlmDbDriver = drbdVlmDbDriverRef;
+        tcpPortPool = tcpPortPoolRef;
+
+        TreeSet<TcpPortNumber> rscPortsBackingSet = new TreeSet<>();
+        rscPorts = transObjFactory.createTransactionPrimitiveSet(
+            this,
+            rscPortsBackingSet,
+            drbdRscDbDriver.getTcpPortDriver()
+        );
+
+        flags = transObjFactory.createStateFlagsImpl(
+            this,
+            DrbdRscFlags.class,
+            drbdRscDbDriverRef.getRscStateFlagPersistence(),
+            initFlags
+        );
+        drbdRscDfnData = Objects.requireNonNull(drbdRscDfnDataRef);
+
+        peerSlots = peerSlotsRef != null ? peerSlotsRef : drbdRscDfnDataRef.getPeerSlots();
+        alStripes = alStripesRef != null ? alStripesRef : drbdRscDfnDataRef.getAlStripes();
+        alStripeSize = alStripeSizeRef != null ? alStripeSizeRef : drbdRscDfnDataRef.getAlStripeSize();
+
+        final @Nullable Integer tmpPortCount;
+        if (rsc instanceof Resource)
+        {
+            initPorts(portListRef, portCountRef, rscPortsBackingSet);
+            tmpPortCount = null;
+        }
+        else
+        {
+            // skip setPorts for snapshots
+            tmpPortCount = Objects.requireNonNull(portCountRef);
+        }
+        snapPortCount = transObjFactory.createNonPersistentTransactionSimpleObject(tmpPortCount);
+
+        transObjs.add(rscPorts);
+        transObjs.add(flags);
+        transObjs.add(drbdRscDfnData);
+        transObjs.add(snapPortCount);
+        transObjs.add(nodeId);
+    }
+
+    private void initPorts(
+        @Nullable Collection<TcpPortNumber> portListRef,
+        @Nullable Integer portCountRef,
+        Set<TcpPortNumber> rscPortsBackingSetRef
+    )
+        throws ValueInUseException, ImplementationError, ValueOutOfRangeException, ExhaustedPoolException
+    {
+        // preserve order so the DrbdRscDfn port is preferred over all others
+        Set<TcpPortNumber> preferredNewPortsRef = new LinkedHashSet<>();
+        @Nullable TcpPortNumber preferredDrbdRscDfnPort = drbdRscDfnData.getTcpPort();
+        if (preferredDrbdRscDfnPort != null)
+        {
+            preferredNewPortsRef.add(preferredDrbdRscDfnPort);
+        }
+        for (DrbdRscData<RSC> peer : drbdRscDfnData.getDrbdRscDataList())
+        {
+            // we do not need to exclude ourselves since "this" was not yet added to drbdRscDfnData.getDrbdRscDataList()
+            if (rscSuffix.equals(peer.rscSuffix))
+            {
+                preferredNewPortsRef.addAll(peer.rscPorts);
+            }
+        }
+        setPorts(portListRef, preferredNewPortsRef, portCountRef, rscPortsBackingSetRef);
+    }
+
+    @Override
+    public DeviceLayerKind getLayerKind()
+    {
+        return DeviceLayerKind.DRBD;
+    }
+
+    @Override
+    public boolean hasFailed()
+    {
+        return failed;
+    }
+
+    public void setFailed(boolean failedRef)
+    {
+        failed = failedRef;
+    }
+
+    @Override
+    public @Nullable AbsRscLayerObject<RSC> getParent()
+    {
+        return parent.get();
+    }
+
+    @Override
+    public void setParent(@Nullable AbsRscLayerObject<RSC> parentObj) throws DatabaseException
+    {
+        parent.set(parentObj);
+    }
+
+    // no setter for children - unmodifiable after initialized
+
+    @Override
+    public NodeId getNodeId()
+    {
+        return nodeId.get();
+    }
+
+    @Override
+    public void setNodeId(NodeId nodeIdRef) throws DatabaseException
+    {
+        nodeId.set(nodeIdRef);
+    }
+
+    // no setNodeId - unmodifiable after initialized
+
+    @Override
+    public @Nullable Collection<TcpPortNumber> getTcpPortList()
+    {
+        return rscPorts;
+    }
+
+    public void setPortCount(int countRef) throws ValueOutOfRangeException, ExhaustedPoolException
+    {
+        if (rscPorts.size() != countRef)
+        {
+            if (rscPorts.size() < countRef)
+            {
+                for (int remaining = countRef - rscPorts.size(); remaining > 0; remaining--)
+                {
+                    rscPorts.add(new TcpPortNumber(tcpPortPool.autoAllocate()));
+                }
+            }
+            else
+            {
+                Iterator<TcpPortNumber> it = new ArrayList<>(rscPorts).iterator();
+                for (int remaining = rscPorts.size() - countRef; remaining > 0; remaining--)
+                {
+                    TcpPortNumber portToRemove = it.next();
+                    rscPorts.remove(portToRemove);
+                    tcpPortPool.deallocate(portToRemove.value);
+                }
+            }
+        }
+    }
+
+    public void setPorts(@Nullable Collection<TcpPortNumber> portsRef)
+        throws ValueInUseException, ImplementationError, ValueOutOfRangeException, ExhaustedPoolException
+    {
+        setPorts(portsRef, null, null, rscPorts);
+    }
+
+    private void setPorts(
+        @Nullable Collection<TcpPortNumber> fixedNewPortsRef,
+        @Nullable Collection<TcpPortNumber> preferredNewPortsRef,
+        @Nullable Integer expectedPortCountRef,
+        Set<TcpPortNumber> targetTcpPortsSetRef
+    )
+        throws ValueInUseException, ImplementationError, ValueOutOfRangeException, ExhaustedPoolException
+    {
+        Set<Integer> allocatedNumbers = new HashSet<>();
+        Set<Integer> deallocatedNumbers = new HashSet<>();
+        try
+        {
+            int expPortCount;
+            if (expectedPortCountRef != null)
+            {
+                expPortCount = expectedPortCountRef;
+            }
+            else if (fixedNewPortsRef != null && !fixedNewPortsRef.isEmpty())
+            {
+                expPortCount = fixedNewPortsRef.size();
+            }
+            else
+            {
+                expPortCount = 1;
+            }
+
+            Set<TcpPortNumber> portsToDeallocate = new HashSet<>(targetTcpPortsSetRef);
+            if (fixedNewPortsRef != null)
+            {
+                for (TcpPortNumber fixedNewPort : fixedNewPortsRef)
+                {
+                    if (targetTcpPortsSetRef.contains(fixedNewPort))
+                    {
+                        portsToDeallocate.remove(fixedNewPort);
+                    }
+                    else
+                    {
+                        tcpPortPool.allocate(fixedNewPort.value);
+                        allocatedNumbers.add(fixedNewPort.value);
+                        targetTcpPortsSetRef.add(fixedNewPort);
+                    }
+                }
+            }
+            for (TcpPortNumber port : portsToDeallocate)
+            {
+                targetTcpPortsSetRef.remove(port);
+                tcpPortPool.deallocate(port.value);
+                deallocatedNumbers.add(port.value);
+            }
+
+            if (preferredNewPortsRef != null)
+            {
+                Iterator<TcpPortNumber> iterator = preferredNewPortsRef.iterator();
+                while (iterator.hasNext() && targetTcpPortsSetRef.size() < expPortCount)
+                {
+                    TcpPortNumber prefTcpPort = iterator.next();
+                    if (tcpPortPool.tryAllocate(prefTcpPort.value))
+                    {
+                        allocatedNumbers.add(prefTcpPort.value);
+                        targetTcpPortsSetRef.add(prefTcpPort);
+                    }
+                }
+            }
+
+            while (targetTcpPortsSetRef.size() < expPortCount)
+            {
+                int autoAllocate = tcpPortPool.autoAllocate();
+                targetTcpPortsSetRef.add(new TcpPortNumber(autoAllocate));
+                allocatedNumbers.add(autoAllocate);
+            }
+        }
+        catch (ValueInUseException | ImplementationError | ValueOutOfRangeException | ExhaustedPoolException exc)
+        {
+            // NumberPools are (currently) not transaction objects so we still need to undo our allocations, if any
+            for (Integer allocNr : allocatedNumbers)
+            {
+                tcpPortPool.deallocate(allocNr);
+            }
+            // undoing a deallocation means re-allocating the number - best effort, it might have been blocked meanwhile
+            for (Integer deallocNr : deallocatedNumbers)
+            {
+                tcpPortPool.tryAllocate(deallocNr);
+            }
+            throw exc;
+        }
+    }
+
+    public int getPortCount()
+    {
+        int ret;
+        if (rsc instanceof Resource)
+        {
+            ret = rscPorts.size();
+            if (ret == 0)
+            {
+                throw new ImplementationError("resource has no ports configured! " + rsc);
+            }
+        }
+        else
+        {
+            @Nullable Integer tmp = snapPortCount.get();
+            if (tmp == null || tmp == 0)
+            {
+                throw new ImplementationError("snapshot has no portCount configured! " + rsc);
+            }
+            ret = tmp;
+        }
+        return ret;
+    }
+
+    @Override
+    public boolean isDiskless()
+    {
+        return flags.isSet(DrbdRscFlags.DISKLESS);
+    }
+
+    @Override
+    public boolean isDisklessForPeers()
+    {
+        return flags.isSet(DrbdRscFlags.DISKLESS) &&
+            flags.isUnset(DrbdRscFlags.DISK_ADDING) &&
+            flags.isUnset(DrbdRscFlags.DISK_REMOVING);
+    }
+
+    @Override
+    public DrbdRscDfnData<RSC> getRscDfnLayerObject()
+    {
+        return drbdRscDfnData;
+    }
+
+    // no setter for drbdRscDfnData - unmodifiable after initialized
+
+    public void putVlmLayerObject(DrbdVlmData<RSC> data)
+    {
+        vlmMap.put(data.getVlmNr(), data);
+    }
+
+    public StateFlags<DrbdRscFlags> getFlags()
+    {
+        return flags;
+    }
+
+    @Override
+    public short getPeerSlots()
+    {
+        return peerSlots;
+    }
+
+    @Override
+    public int getAlStripes()
+    {
+        return alStripes;
+    }
+
+    @Override
+    public long getAlStripeSize()
+    {
+        return alStripeSize;
+    }
+
+    @Override
+    public void delete() throws DatabaseException
+    {
+        super.delete();
+        @Nullable TransactionSet<DrbdRscData<?>, TcpPortNumber> localPorts = rscPorts;
+        if (localPorts != null)
+        {
+            for (TcpPortNumber port : localPorts)
+            {
+                tcpPortPool.deallocate(port.value);
+            }
+        }
+        drbdRscDfnData.getDrbdRscDataList().remove(this);
+    }
+
+    @Override
+    protected void deleteVlmFromDatabase(DrbdVlmData<RSC> drbdVlmData) throws DatabaseException
+    {
+        drbdVlmDbDriver.delete(drbdVlmData);
+    }
+
+    @Override
+    protected void deleteRscFromDatabase() throws DatabaseException
+    {
+        drbdRscDbDriver.delete(this);
+    }
+
+    /*
+     * Temporary data - will not be persisted
+     */
+
+    @Override
+    public boolean exists()
+    {
+        return exists;
+    }
+
+    public void setExists(boolean existsRef)
+    {
+        exists = existsRef;
+    }
+
+    public boolean isAdjustRequired()
+    {
+        return requiresAdjust;
+    }
+
+    public void setAdjustRequired(boolean requiresAdjustRef)
+    {
+        requiresAdjust = requiresAdjustRef;
+    }
+
+    public boolean isPrimary()
+    {
+        return isPrimary;
+    }
+
+    public void setPrimary(boolean isPrimaryRef)
+    {
+        isPrimary = isPrimaryRef;
+    }
+
+    public @Nullable Boolean mayPromote()
+    {
+        return mayPromote;
+    }
+
+    public void setMayPromote(@Nullable Boolean mayPromoteFlag)
+    {
+        mayPromote = mayPromoteFlag;
+    }
+
+    public @Nullable Integer getPromotionScore()
+    {
+        return promotionScore;
+    }
+
+    public void setPromotionScore(@Nullable Integer promotionScoreRef)
+    {
+        promotionScore = promotionScoreRef;
+    }
+
+    @Override
+    public Boolean isSuspended()
+    {
+        return isSuspended;
+    }
+
+    @Override
+    public void setIsSuspended(boolean isSuspendedRef)
+    {
+        isSuspended = isSuspendedRef;
+    }
+
+    @Override
+    public RscLayerDataApi asPojo()
+    {
+        List<DrbdVlmPojo> vlmPojos = new ArrayList<>();
+        for (DrbdVlmData<RSC> drbdVlmData : vlmMap.values())
+        {
+            vlmPojos.add(drbdVlmData.asPojo());
+        }
+        @Nullable TreeSet<Integer> portsInt;
+        @Nullable Set<TcpPortNumber> localPorts = rscPorts;
+        if (localPorts != null)
+        {
+            portsInt = new TreeSet<>();
+            for (TcpPortNumber port : localPorts)
+            {
+                portsInt.add(port.value);
+            }
+        }
+        else
+        {
+            portsInt = null;
+        }
+        return new DrbdRscPojo(
+            rscLayerId,
+            getChildrenPojos(),
+            getResourceNameSuffix(),
+            drbdRscDfnData.getApiData(),
+            nodeId.get().value,
+            portsInt,
+            getPortCount(),
+            peerSlots,
+            alStripes,
+            alStripeSize,
+            flags.getFlagsBits(),
+            vlmPojos,
+            suspend.get(),
+            promotionScore,
+            mayPromote,
+            ignoreReasons.get()
+        );
+    }
+
+    /**
+     * Builds a PriorityProps and checks if "DrbdOptions/SkipDisk" is {@code "True"}. Priority of properties:
+     * <ul>
+     * <li>{@link AbsResource} (i.e. {@link Resource} or {@link Snapshot})</li>
+     * <li>all participating {@link StorPool}s. The order is depending on
+     * {@link LayerVlmUtils#getStorPools(AbsResource)}</li>
+     * <li>{@link Node}</li>
+     * <li>{@link ResourceDefinition}</li>
+     * <li>Satellite props (from parameter)</li>
+     * </ul>
+     *
+     *
+     * @return true if "DrbdOptions/SkipDisk" is "True" (ignoring case). False otherwise
+     *
+     */
+    public boolean isSkipDiskEnabled(ReadOnlyProps stltProps)
+    {
+        final boolean ret;
+        RSC absRsc = getAbsResource();
+        if (absRsc instanceof Resource rsc)
+        {
+            PriorityProps prioProps = new PriorityProps(rsc.getProps());
+            for (StorPool storPool : LayerVlmUtils.getStorPools(rsc))
+            {
+                prioProps.addProps(storPool.getProps());
+            }
+            prioProps.addProps(
+                rsc.getNode().getProps(),
+                rsc.getResourceDefinition().getProps(),
+                stltProps
+            );
+            ret = ApiConsts.VAL_TRUE.equalsIgnoreCase(
+                prioProps.getProp(ApiConsts.KEY_DRBD_SKIP_DISK, ApiConsts.NAMESPC_DRBD_OPTIONS)
+            );
+        }
+        else
+        {
+            // checking skip-disk does not make sense on a snapshot
+            ret = false;
+        }
+
+        return ret;
+    }
+
+    public boolean isResFileReady()
+    {
+        boolean isReady = true;
+        if (!isDiskless())
+        {
+            for (DrbdVlmData<RSC> vlmData : this.getVlmLayerObjects().values())
+            {
+                if (vlmData.getDataDevice() == null ||
+                    (vlmData.isUsingExternalMetaData() && vlmData.getMetaDiskPath() == null))
+                {
+                    isReady = false;
+                    break;
+                }
+            }
+        }
+        return isReady;
+    }
+}

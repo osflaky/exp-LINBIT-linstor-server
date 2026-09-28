@@ -1,0 +1,678 @@
+package com.linbit.linstor.api.rest.v1;
+
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.prop.LinStorObject;
+import com.linbit.linstor.api.rest.v1.serializer.Json;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes.ToggleDiskDiskful;
+import com.linbit.linstor.api.rest.v1.utils.ApiCallRcRestUtils;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlPropsInfoApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscActivateApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscCrtApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscDeleteApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscDfnDeleteApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscMakeAvailableApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscToggleDiskApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscToggleDiskApiCallHandler.ToggleOp;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscUnmakeAvailableApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.ResourceList;
+import com.linbit.linstor.core.apis.ResourceApi;
+import com.linbit.linstor.core.apis.ResourceWithPayloadApi;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.Resource.DiskfulBy;
+import com.linbit.linstor.logging.ErrorReporter;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DELETE;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.PUT;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.Suspended;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.glassfish.grizzly.http.server.Request;
+import org.slf4j.MDC;
+import reactor.core.publisher.Flux;
+
+@Path("v1/resource-definitions/{rscName}/resources")
+@Produces(MediaType.APPLICATION_JSON)
+public class Resources
+{
+    private final RequestHelper requestHelper;
+    private final CtrlApiCallHandler ctrlApiCallHandler;
+    private final CtrlRscCrtApiCallHandler ctrlRscCrtApiCallHandler;
+    private final CtrlRscDeleteApiCallHandler ctrlRscDeleteApiCallHandler;
+    private final CtrlRscDfnDeleteApiCallHandler ctrlRscDfnDeleteApiCallHandler;
+    private final CtrlRscToggleDiskApiCallHandler ctrlRscToggleDiskApiCallHandler;
+    private final CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandler;
+    private final CtrlRscMakeAvailableApiCallHandler ctrlRscMakeAvailableApiCallHandler;
+    private final CtrlRscUnmakeAvailableApiCallHandler ctrlRscUnmakeAvailableApiCallHandler;
+    private final ObjectMapper objectMapper;
+    private final CtrlPropsInfoApiCallHandler ctrlPropsInfoApiCallHandler;
+
+    @Inject
+    public Resources(
+        RequestHelper requestHelperRef,
+        CtrlApiCallHandler ctrlApiCallHandlerRef,
+        CtrlRscCrtApiCallHandler ctrlRscCrtApiCallHandlerRef,
+        CtrlRscDeleteApiCallHandler ctrlRscDeleteApiCallHandlerRef,
+        CtrlRscDfnDeleteApiCallHandler ctrlRscDfnDeleteApiCallHandlerRef,
+        CtrlRscToggleDiskApiCallHandler ctrlRscToggleDiskApiCallHandlerRef,
+        CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandlerRef,
+        CtrlRscMakeAvailableApiCallHandler ctrlRscMakeAvailableApiCallHandlerRef,
+        CtrlRscUnmakeAvailableApiCallHandler ctrlRscUnmakeAvailableApiCallHandlerRef,
+        CtrlPropsInfoApiCallHandler ctrlPropsInfoApiCallHandlerRef
+    )
+    {
+        requestHelper = requestHelperRef;
+        ctrlApiCallHandler = ctrlApiCallHandlerRef;
+        ctrlRscCrtApiCallHandler = ctrlRscCrtApiCallHandlerRef;
+        ctrlRscDeleteApiCallHandler = ctrlRscDeleteApiCallHandlerRef;
+        ctrlRscDfnDeleteApiCallHandler = ctrlRscDfnDeleteApiCallHandlerRef;
+        ctrlRscToggleDiskApiCallHandler = ctrlRscToggleDiskApiCallHandlerRef;
+        ctrlRscActivateApiCallHandler = ctrlRscActivateApiCallHandlerRef;
+        ctrlRscMakeAvailableApiCallHandler = ctrlRscMakeAvailableApiCallHandlerRef;
+        ctrlRscUnmakeAvailableApiCallHandler = ctrlRscUnmakeAvailableApiCallHandlerRef;
+        ctrlPropsInfoApiCallHandler = ctrlPropsInfoApiCallHandlerRef;
+
+        objectMapper = new ObjectMapper();
+    }
+
+    @GET
+    public Response listResources(
+        @Context Request request,
+        @PathParam("rscName") String rscName,
+        @DefaultValue("0") @QueryParam("limit") int limit,
+        @DefaultValue("0") @QueryParam("offset") int offset
+    )
+    {
+        return listResources(request, rscName, null, limit, offset);
+    }
+
+
+    @GET
+    @Path("{nodeName}")
+    public Response listResources(
+        @Context Request request,
+        @PathParam("rscName") String rscName,
+        @PathParam("nodeName") @Nullable String nodeName,
+        @DefaultValue("0") @QueryParam("limit") int limit,
+        @DefaultValue("0") @QueryParam("offset") int offset
+    )
+    {
+        return requestHelper.doInScope(ApiConsts.API_LST_RSC, request, () ->
+        {
+            ArrayList<String> nodes = new ArrayList<>();
+            if (nodeName != null && !nodeName.isEmpty())
+            {
+                nodes.add(nodeName);
+            }
+            ResourceList resourceList = ctrlApiCallHandler.listResource(rscName, nodes);
+            Stream<ResourceApi> rscApiStream = resourceList.getResources().stream();
+            if (limit > 0)
+            {
+                rscApiStream = rscApiStream.skip(offset).limit(limit);
+            }
+
+            final List<JsonGenTypes.Resource> rscs = rscApiStream
+                .map(rscApi -> Json.apiToResource(rscApi, resourceList.getSatelliteStates()))
+                .collect(Collectors.toList());
+
+            return RequestHelper.queryRequestResponse(
+                objectMapper,
+                ApiConsts.FAIL_NOT_FOUND_RSC,
+                String.format("Resource '%s' on", rscName),
+                nodeName,
+                rscs
+            );
+        }, false);
+    }
+
+    private static class ResourceWithPayload implements ResourceWithPayloadApi
+    {
+        private final JsonGenTypes.ResourceCreate rscPayload;
+
+        ResourceWithPayload(JsonGenTypes.ResourceCreate rsc, String rscName)
+        {
+            if (rsc.resource.flags.contains(ApiConsts.FLAG_DISKLESS))
+            {
+                for (String layer : rsc.layer_list)
+                {
+                    if (layer.equalsIgnoreCase("drbd"))
+                    {
+                        rsc.resource.flags.add(ApiConsts.FLAG_DRBD_DISKLESS);
+                    }
+                    if (layer.equalsIgnoreCase("nvme"))
+                    {
+                        rsc.resource.flags.add(ApiConsts.FLAG_NVME_INITIATOR);
+                    }
+                }
+            }
+
+            rscPayload = rsc;
+            rscPayload.resource.name = rscName;
+        }
+
+        @Override
+        public ResourceApi getRscApi()
+        {
+            return Json.resourceToApi(rscPayload.resource);
+        }
+
+        @Override
+        public List<String> getLayerStack()
+        {
+            return rscPayload.layer_list;
+        }
+
+        @Override
+        public Integer getDrbdNodeId()
+        {
+            return rscPayload.drbd_node_id;
+        }
+
+        @Override
+        public @Nullable Integer getPortCount()
+        {
+            return rscPayload.drbd_tcp_port_count;
+        }
+
+        @Override
+        public @Nullable List<Integer> getPorts()
+        {
+            return rscPayload.drbd_tcp_ports;
+        }
+
+        @Override
+        public @Nullable Boolean isDrbdClient()
+        {
+            return rscPayload.drbd_client;
+        }
+    }
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    public void createResource(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("rscName") String rscName,
+        String jsonData
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            List<JsonGenTypes.ResourceCreate> rscList = Arrays.asList(
+                objectMapper.readValue(jsonData, JsonGenTypes.ResourceCreate[].class)
+            );
+
+            List<ResourceWithPayloadApi> rscWithPayloadApiList = rscList.stream()
+                .map(resourceCreateData -> new ResourceWithPayload(resourceCreateData, rscName))
+                .collect(Collectors.toList());
+
+            @Nullable Boolean copyAllSnaps = rscList.get(0).copy_all_snaps;
+            Flux<ApiCallRc> flux = ctrlRscCrtApiCallHandler.createResource(
+                rscWithPayloadApiList,
+                Resource.DiskfulBy.USER,
+                copyAllSnaps != null && copyAllSnaps,
+                rscList.get(0).snap_names,
+                false
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_CRT_RSC,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux, Response.Status.CREATED)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Path("{nodeName}")
+    public void createResource(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("rscName") String rscName,
+        @PathParam("nodeName") String nodeName,
+        String jsonData
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            // stuff single resource in a array and forward to the multiple resource creator
+            JsonGenTypes.ResourceCreate rscData = objectMapper.readValue(jsonData, JsonGenTypes.ResourceCreate.class);
+            if (rscData.resource == null)
+            {
+                rscData.resource = new JsonGenTypes.Resource();
+            }
+            rscData.resource.node_name = nodeName;
+            ArrayList<JsonGenTypes.ResourceCreate> rscDatas = new ArrayList<>();
+            rscDatas.add(rscData);
+
+            createResource(request, asyncResponse, rscName, objectMapper.writeValueAsString(rscDatas));
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @PUT
+    @Path("{nodeName}")
+    public void modifyResource(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName,
+        String jsonData
+    )
+        throws IOException
+    {
+        JsonGenTypes.ResourceModify modifyData = objectMapper
+            .readValue(jsonData, JsonGenTypes.ResourceModify.class);
+
+        Flux<ApiCallRc> flux = ctrlApiCallHandler.modifyRsc(
+            null,
+            nodeName,
+            rscName,
+            modifyData.override_props,
+            new HashSet<>(modifyData.delete_props),
+            new HashSet<>(modifyData.delete_namespaces),
+            modifyData.drbd_tiebreaker,
+            modifyData.drbd_client
+        );
+
+        requestHelper.doFlux(
+            ApiConsts.API_MOD_RSC,
+            request,
+            asyncResponse,
+            ApiCallRcRestUtils.mapToMonoResponse(flux, Response.Status.OK)
+        );
+    }
+
+    @DELETE
+    @Path("{nodeName}")
+    public void deleteResource(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName,
+        @DefaultValue("false") @QueryParam("keep_tiebreaker") boolean keepTiebreakerRef
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            Flux<ApiCallRc> flux = ctrlRscDeleteApiCallHandler.deleteResource(nodeName, rscName, keepTiebreakerRef);
+
+            requestHelper.doFlux(
+                ApiConsts.API_DEL_RSC,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+    }
+
+    @DELETE
+    public void truncateResourceDefinition(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("rscName") String rscName,
+        @DefaultValue("false") @QueryParam("delete_empty_resource_definition")
+            boolean deleteEmptyRscDfn
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            Flux<ApiCallRc> flux = ctrlRscDfnDeleteApiCallHandler.truncateResourceDefinition(
+                rscName,
+                deleteEmptyRscDfn
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_TRUNCATE_RSC_DFN,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+    }
+
+    @POST
+    @Path("{nodeName}/make-available")
+    public void makeResourceAvailable(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeNameRef,
+        @PathParam("rscName") String rscNameRef,
+        String jsonData
+    )
+    {
+        JsonGenTypes.ResourceMakeAvailable rscData;
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            rscData = objectMapper.readValue(jsonData, JsonGenTypes.ResourceMakeAvailable.class);
+
+            Flux<ApiCallRc> flux = ctrlRscMakeAvailableApiCallHandler
+                .makeResourceAvailable(
+                    nodeNameRef,
+                    rscNameRef,
+                    rscData.layer_list,
+                    rscData.diskful,
+                    rscData.drbd_tcp_ports,
+                    rscData.copy_all_snaps != null && rscData.copy_all_snaps,
+                    rscData.snap_names,
+                    rscData.auto_manage_dual_primary
+                );
+            requestHelper.doFlux(
+                ApiConsts.API_MAKE_RSC_AVAIL,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux, Response.Status.OK)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @POST
+    @Path("{nodeName}/unmake-available")
+    public void unmakeResourceAvailable(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeNameRef,
+        @PathParam("rscName") String rscNameRef
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            Flux<ApiCallRc> flux = ctrlRscUnmakeAvailableApiCallHandler
+                .unmakeResourceAvailable(nodeNameRef, rscNameRef);
+            requestHelper.doFlux(
+                ApiConsts.API_UNMAKE_RSC_AVAIL,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux, Response.Status.OK)
+            );
+        }
+    }
+
+    @PUT
+    @Path("{nodeName}/toggle-disk")
+    public void toggleDisk(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName,
+        String jsonData
+    )
+    {
+        try
+        {
+            JsonGenTypes.ToggleDiskRequest req = RequestHelper.parseJsonOrDefault(
+                objectMapper,
+                jsonData,
+                JsonGenTypes.ToggleDiskRequest.class,
+                JsonGenTypes.ToggleDiskRequest::new
+            );
+            Flux<ApiCallRc> flux = ctrlRscToggleDiskApiCallHandler.resourceToggleDisk(
+                nodeName,
+                rscName,
+                req.storage_pool,
+                req.migrate_from,
+                req.layer_list,
+                CtrlRscToggleDiskApiCallHandler.ToggleOp.parse(req.operation),
+                DiskfulBy.USER // ACH will ignore this if we toggle into any kind of diskless
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_TOGGLE_DISK,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/toggle-disk/diskless")
+    public void toggleDiskDiskless(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName
+    )
+    {
+        toggleDiskDiskless(request, asyncResponse, nodeName, rscName, null);
+    }
+
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/toggle-disk/diskless/{disklessPool}")
+    public void toggleDiskDiskless(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName,
+        @PathParam("disklessPool") @Nullable String disklessPool
+    )
+    {
+        Flux<ApiCallRc> flux = ctrlRscToggleDiskApiCallHandler.resourceToggleDisk(
+            nodeName,
+            rscName,
+            disklessPool,
+            null,
+            null,
+            ToggleOp.INTO_DRBD_DISKLESS,
+            null
+        );
+
+        requestHelper.doFlux(
+            ApiConsts.API_TOGGLE_DISK,
+            request,
+            asyncResponse,
+            ApiCallRcRestUtils.mapToMonoResponse(flux)
+        );
+    }
+
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/toggle-disk/diskful")
+    public void toggleDiskDiskful(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName
+    )
+    {
+        toggleDiskDiskful(request, asyncResponse, nodeName, rscName, null, null);
+    }
+
+    @SuppressWarnings("removal")
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/toggle-disk/diskful/{storagePool}")
+    public void toggleDiskDiskful(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName,
+        @PathParam("storagePool") @Nullable String storagePool,
+        @Nullable String jsonData
+    )
+    {
+        try
+        {
+            ToggleDiskDiskful data = RequestHelper.parseJsonOrDefault(
+                objectMapper, jsonData, JsonGenTypes.ToggleDiskDiskful.class, ToggleDiskDiskful::new
+            );
+            Flux<ApiCallRc> flux = ctrlRscToggleDiskApiCallHandler.resourceToggleDisk(
+                nodeName,
+                rscName,
+                storagePool,
+                null,
+                data.layer_list,
+                ToggleOp.INTO_DRBD_DISKFUL,
+                Resource.DiskfulBy.USER
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_TOGGLE_DISK,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/migrate-disk/{fromNode}")
+    public void migrateDisk(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("fromNode") String fromNode,
+        @PathParam("rscName") String rscName
+    )
+    {
+        migrateDisk(request, asyncResponse, nodeName, fromNode, rscName, null, null);
+    }
+
+    @SuppressWarnings("removal")
+    @Deprecated(since = "v1.34.0")
+    @PUT
+    @Path("{nodeName}/migrate-disk/{fromNode}/{storagePool}")
+    public void migrateDisk(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("fromNode") String fromNode,
+        @PathParam("rscName") String rscName,
+        @PathParam("storagePool") @Nullable String storagePool,
+        @Nullable String jsonData
+    )
+    {
+        try
+        {
+            ToggleDiskDiskful data = RequestHelper.parseJsonOrDefault(
+                objectMapper, jsonData, JsonGenTypes.ToggleDiskDiskful.class, ToggleDiskDiskful::new
+            );
+            Flux<ApiCallRc> flux = ctrlRscToggleDiskApiCallHandler.resourceToggleDisk(
+                nodeName,
+                rscName,
+                storagePool,
+                fromNode,
+                data.layer_list,
+                ToggleOp.INTO_DRBD_DISKFUL,
+                Resource.DiskfulBy.USER
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_TOGGLE_DISK,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+
+    @POST
+    @Path("{nodeName}/activate")
+    public void activate(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName
+    )
+    {
+        Flux<ApiCallRc> flux = ctrlRscActivateApiCallHandler
+            .activateRsc(nodeName, rscName);
+
+        requestHelper.doFlux(
+            ApiConsts.API_ACTIVATE_RSC,
+            request,
+            asyncResponse,
+            ApiCallRcRestUtils.mapToMonoResponse(flux)
+        );
+    }
+
+    @POST
+    @Path("{nodeName}/deactivate")
+    public void deactivate(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("nodeName") String nodeName,
+        @PathParam("rscName") String rscName
+        )
+    {
+        Flux<ApiCallRc> flux = ctrlRscActivateApiCallHandler
+            .deactivateRsc(nodeName, rscName);
+
+        requestHelper.doFlux(
+            ApiConsts.API_DEACTIVATE_RSC,
+            request,
+            asyncResponse,
+            ApiCallRcRestUtils.mapToMonoResponse(flux)
+        );
+    }
+
+    @GET
+    @Path("properties/info")
+    public Response listCtrlPropsInfo(
+        @Context Request request
+    )
+    {
+        return requestHelper.doInScope(
+            ApiConsts.API_LST_PROPS_INFO, request,
+            () -> Response.status(Response.Status.OK)
+                .entity(
+                    objectMapper
+                        .writeValueAsString(ctrlPropsInfoApiCallHandler.listFilteredProps(LinStorObject.RSC))
+                )
+                .build(),
+            false
+        );
+    }
+}

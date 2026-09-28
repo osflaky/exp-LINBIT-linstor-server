@@ -1,0 +1,683 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiCallRcWith;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.AutoSelectFilterApi;
+import com.linbit.linstor.api.pojo.AutoSelectFilterPojo;
+import com.linbit.linstor.api.pojo.builder.AutoSelectFilterBuilder;
+import com.linbit.linstor.core.CoreModule.NodesMap;
+import com.linbit.linstor.core.LinStor;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperContext;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscAutoHelper;
+import com.linbit.linstor.core.apicallhandler.controller.autoplacer.Autoplacer;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.CopySnapsHelper;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.SharedStorPoolName;
+import com.linbit.linstor.core.objects.AutoSelectorConfig;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.objects.VolumeDefinition;
+import com.linbit.linstor.event.EventStreamClosedException;
+import com.linbit.linstor.event.EventStreamTimeoutException;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.kinds.DeviceProviderKind;
+import com.linbit.linstor.utils.layer.LayerVlmUtils;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+import com.linbit.utils.PairNonNull;
+import com.linbit.utils.StringUtils;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import reactor.core.publisher.Flux;
+
+@Singleton
+public class CtrlRscAutoPlaceApiCallHandler
+{
+    private final ScopeRunner scopeRunner;
+    private final Autoplacer autoplacer;
+    private final FreeCapacityFetcher freeCapacityFetcher;
+    private final CtrlRscCrtApiHelper ctrlRscCrtApiHelper;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final NodesMap nodesMap;
+    private final ResponseConverter responseConverter;
+    private final LockGuardFactory lockGuardFactory;
+    private final Provider<CtrlRscAutoHelper> autoHelperProvider;
+    private final CopySnapsHelper copySnapHelper;
+
+    @Inject
+    public CtrlRscAutoPlaceApiCallHandler(
+        ScopeRunner scopeRunnerRef,
+        Autoplacer autoplacerRef,
+        FreeCapacityFetcher freeCapacityFetcherRef,
+        CtrlRscCrtApiHelper ctrlRscCrtApiHelperRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        NodesMap nodesMapRef,
+        ResponseConverter responseConverterRef,
+        LockGuardFactory lockGuardFactoryRef,
+        Provider<CtrlRscAutoHelper> autoHelperProviderRef,
+        CopySnapsHelper copySnapHelperRef
+    )
+    {
+        scopeRunner = scopeRunnerRef;
+        autoplacer = autoplacerRef;
+        freeCapacityFetcher = freeCapacityFetcherRef;
+        ctrlRscCrtApiHelper = ctrlRscCrtApiHelperRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        nodesMap = nodesMapRef;
+        responseConverter = responseConverterRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        autoHelperProvider = autoHelperProviderRef;
+        copySnapHelper = copySnapHelperRef;
+    }
+
+    public Flux<ApiCallRc> autoPlace(
+        String rscNameStr,
+        AutoSelectFilterApi selectFilter,
+        boolean copyAllSnapsRef,
+        List<String> snapNamesToCopyRef
+    )
+    {
+        Map<String, String> objRefs = new TreeMap<>();
+        objRefs.put(ApiConsts.KEY_RSC_DFN, rscNameStr);
+
+        ResponseContext context = new ResponseContext(
+            ApiOperation.makeRegisterOperation(),
+            getObjectDescription(rscNameStr),
+            getObjectDescriptionInline(rscNameStr),
+            ApiConsts.MASK_RSC,
+            objRefs
+        );
+
+        return freeCapacityFetcher.fetchThinFreeCapacities(Collections.emptySet()).flatMapMany(
+            // fetchThinFreeCapacities also updates the freeSpaceManager. we can safely ignore
+            // the freeCapacities parameter here
+            ignoredFreeCapacities -> scopeRunner.fluxInTransactionalScope(
+                "Auto-place resource",
+                lockGuardFactory.buildDeferred(
+                    LockType.WRITE,
+                    LockObj.NODES_MAP,
+                    LockObj.RSC_DFN_MAP,
+                    LockObj.STOR_POOL_DFN_MAP
+                ),
+                () -> autoPlaceInTransaction(
+                    rscNameStr,
+                    selectFilter,
+                    copyAllSnapsRef,
+                    snapNamesToCopyRef,
+                    context
+                )
+                )
+            )
+            .transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    Flux<ApiCallRc> autoPlaceInTransaction(
+        String rscNameStr,
+        @Nullable AutoSelectFilterApi selectFilterRef,
+        boolean copyAllSnapsRef,
+        List<String> snapNamesToCopyRef,
+        ResponseContext context
+    )
+    {
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+
+        ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscNameStr);
+        AutoSelectorConfig rscGrpSelectConfig = rscDfn.getResourceGroup().getAutoPlaceConfig();
+
+        AutoSelectFilterPojo mergedSelectFilter = AutoSelectFilterPojo.merge(
+            selectFilterRef,
+            rscGrpSelectConfig.getApiData()
+        );
+
+        List<Resource> alreadyPlaced = privilegedStreamResources(rscDfn).collect(Collectors.toList());
+
+        alreadyPlaced = filterOnlyOneRscPerSharedSp(alreadyPlaced);
+
+        List<Resource> alreadyPlacedDiskfulNotDeleting = new ArrayList<>();
+        List<Resource> alreadyPlacedDisklessNotDeleting = new ArrayList<>();
+
+        for (Resource rsc : alreadyPlaced)
+        {
+            // we do not care about deleting / evicted resources. just make sure to not count them
+            if (
+                !isSomeFlagSet(rsc, Resource.Flags.DELETE, Resource.Flags.EVICTED, Resource.Flags.EVACUATE) &&
+                    !isNodeFlagSet(rsc, Node.Flags.EVACUATE) &&
+                    !hasSkipDiskProp(rsc)
+            )
+            {
+                if (isFlagSet(rsc, Resource.Flags.DISKLESS))
+                {
+                    alreadyPlacedDisklessNotDeleting.add(rsc);
+                }
+                else
+                {
+                    alreadyPlacedDiskfulNotDeleting.add(rsc);
+                }
+            }
+        }
+
+        int additionalPlaceCount;
+        @Nullable Integer additionalReplicaCount = mergedSelectFilter.getAdditionalReplicaCount();
+        String disklessType = mergedSelectFilter.getDisklessType();
+        boolean asDiskful = disklessType == null || disklessType.isEmpty();
+        if (additionalReplicaCount != null && additionalReplicaCount > 0)
+        {
+            additionalPlaceCount = additionalReplicaCount;
+        }
+        else
+        {
+            /*
+             * If the resource is already deployed on X nodes, and the placement count now is Y:
+             * case Y > X
+             * only deploy (Y-X) additional resources, but on the previously selected storPoolName.
+             * case Y == X
+             * either NOP or additionally deploy disklessly on new nodes.
+             * case Y < X
+             * error.
+             */
+            @Nullable Integer replCtInteger = mergedSelectFilter.getReplicaCount();
+            int replCt = replCtInteger == null ? 0 : replCtInteger;
+            if (asDiskful)
+            {
+                additionalPlaceCount = replCt - alreadyPlacedDiskfulNotDeleting.size();
+            }
+            else
+            {
+                additionalPlaceCount = replCt - alreadyPlacedDisklessNotDeleting.size();
+            }
+        }
+        if (additionalPlaceCount < 0)
+        {
+            throw new ApiRcException(makePlaceCountTooLowResponse(rscNameStr, alreadyPlaced));
+        }
+
+        // every replica of a DRBD resource needs a node id and DRBD only has 0-31 of those,
+        // so reject a placement that could never be deployed no matter how many nodes exist.
+        // Same check as on resource-group create/modify, but against the resources that are
+        // actually deployed.
+        List<DeviceLayerKind> rscDfnLayerStack = rscDfn.getLayerStack();
+        int totalAfterPlacement = alreadyPlacedDiskfulNotDeleting.size() +
+            alreadyPlacedDisklessNotDeleting.size() + additionalPlaceCount;
+        if ((rscDfnLayerStack.isEmpty() || rscDfnLayerStack.contains(DeviceLayerKind.DRBD)) &&
+            totalAfterPlacement > CtrlRscGrpApiCallHandler.MAX_DRBD_REPLICAS)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_PLACE_COUNT,
+                    "Auto-placing resource: " + rscNameStr + ", the requested placement would result in " +
+                        totalAfterPlacement + " replicas, but DRBD supports at most " +
+                        CtrlRscGrpApiCallHandler.MAX_DRBD_REPLICAS + " replicas per resource (node ids 0-31).",
+                    true
+                )
+            );
+        }
+
+        @Nullable List<String> storPoolNameList = mergedSelectFilter.getStorPoolNameList();
+        @Nullable List<String> storPoolDisklessNameList = mergedSelectFilter.getStorPoolDisklessNameList();
+
+        Flux<ApiCallRc> deploymentResponses;
+        Flux<ApiCallRc> autoFlux;
+        @Nullable Boolean disklessOnRemaining = mergedSelectFilter.getDisklessOnRemaining();
+        if (additionalPlaceCount == 0 && (disklessOnRemaining == null || !disklessOnRemaining))
+        {
+            List<Resource> listForResponse;
+            if (asDiskful)
+            {
+                listForResponse = alreadyPlacedDiskfulNotDeleting;
+            }
+            else
+            {
+                listForResponse = alreadyPlacedDisklessNotDeleting;
+            }
+            responseConverter.addWithDetail(responses, context,
+                makeAlreadyDeployedResponse(
+                    rscNameStr,
+                    listForResponse
+                )
+            );
+
+            deploymentResponses = Flux.empty();
+        }
+        else
+        {
+            List<String> disklessNodeNames = alreadyPlacedDisklessNotDeleting.stream()
+                .map(rsc -> rsc.getNode().getName().displayValue).collect(Collectors.toList());
+
+            @Nullable List<String> doNotPlaceWithRscFromMerged = mergedSelectFilter.getDoNotPlaceWithRscList();
+            List<String> doNotPlaceWithRsc = new ArrayList<>();
+            if (doNotPlaceWithRscFromMerged != null)
+            {
+                doNotPlaceWithRsc.addAll(doNotPlaceWithRscFromMerged);
+            }
+            doNotPlaceWithRsc.add(rscNameStr);
+            AutoSelectFilterPojo autoStorConfig = new AutoSelectFilterBuilder(mergedSelectFilter)
+                .setAdditionalPlaceCount(additionalPlaceCount) // no forced place count, only additional place count
+                .setStorPoolNameList(storPoolNameList)
+                .setStorPoolDisklessNameList(storPoolDisklessNameList)
+                .setDoNotPlaceWithRscList(doNotPlaceWithRsc)
+                .setSkipAlreadyPlacedOnNodeNamesCheck(disklessNodeNames)
+                .build();
+
+            final long rscSize = calculateResourceDefinitionSize(rscDfn);
+
+            Set<StorPool> candidate = findBestCandidate(
+                autoStorConfig,
+                rscDfn,
+                rscSize
+            );
+
+            if (candidate != null)
+            {
+                PairNonNull<List<Flux<ApiCallRc>>, Set<Resource>> deployedResources = createResources(
+                    context,
+                    responses,
+                    rscNameStr,
+                    disklessOnRemaining,
+                    candidate,
+                    null,
+                    mergedSelectFilter.getLayerStackList(),
+                    mergedSelectFilter.getDrbdPortCount(),
+                    !asDiskful
+                );
+
+                autoFlux = autoHelperProvider.get()
+                    .manage(
+                        new AutoHelperContext(responses, context, rscDfn)
+                            .withSelectFilter(mergedSelectFilter)
+                    )
+                    .flux();
+
+                ctrlTransactionHelper.commit();
+
+                deploymentResponses = deployedResources.objB.isEmpty() ?
+                    Flux.empty() :
+                    ctrlRscCrtApiHelper.deployResources(context, deployedResources.objB);
+                deploymentResponses = Flux.merge(deployedResources.objA)
+                    .concatWith(deploymentResponses)
+                    .concatWith(autoFlux)
+                    .concatWith(
+                        copySnapHelper.getCopyFlux(
+                            deployedResources.objB,
+                            copyAllSnapsRef,
+                            snapNamesToCopyRef,
+                            context,
+                            false
+                        )
+                    );
+            }
+            else
+            {
+                throw failNotEnoughCandidates(storPoolNameList, rscSize, autoStorConfig);
+            }
+        }
+        return Flux
+            .<ApiCallRc>just(responses)
+            .concatWith(deploymentResponses)
+            .onErrorResume(CtrlResponseUtils.DelayedApiRcException.class, ignored -> Flux.empty())
+            .onErrorResume(EventStreamTimeoutException.class,
+                ignored -> Flux.just(ctrlRscCrtApiHelper.makeResourceDidNotAppearMessage(context)))
+            .onErrorResume(EventStreamClosedException.class,
+                ignored -> Flux.just(ctrlRscCrtApiHelper.makeEventStreamDisappearedUnexpectedlyMessage(context)));
+    }
+
+    private ArrayList<Resource> filterOnlyOneRscPerSharedSp(List<Resource> list)
+    {
+        Set<SharedStorPoolName> visitedSharedStorPoolNames = new HashSet<>();
+        ArrayList<Resource> ret = new ArrayList<>();
+        for (Resource rsc : list)
+        {
+            boolean sharedSpAlreadyCounted = false;
+            Set<SharedStorPoolName> sharedSpNames = getSharedStorPoolNames(rsc);
+            for (SharedStorPoolName sharedSpName : sharedSpNames)
+            {
+                if (visitedSharedStorPoolNames.contains(sharedSpName))
+                {
+                    sharedSpAlreadyCounted = true;
+                    break;
+                }
+            }
+            if (!sharedSpAlreadyCounted)
+            {
+                visitedSharedStorPoolNames.addAll(sharedSpNames);
+                ret.add(rsc);
+            }
+        }
+
+        return ret;
+    }
+
+    private Set<SharedStorPoolName> getSharedStorPoolNames(Resource rsc)
+    {
+        Set<SharedStorPoolName> sharedSpNames = new TreeSet<>();
+        for (StorPool sp : LayerVlmUtils.getStorPools(rsc, false))
+        {
+            sharedSpNames.add(sp.getSharedStorPoolName());
+        }
+        return sharedSpNames;
+    }
+
+    private Set<StorPool> findBestCandidate(
+        AutoSelectFilterPojo autoStorConfigRef,
+        @Nullable ResourceDefinition rscDfnRef,
+        long rscSize
+    )
+    {
+        return autoplacer.autoPlace(autoStorConfigRef, rscDfnRef, rscSize);
+    }
+
+    public PairNonNull<List<Flux<ApiCallRc>>, Set<Resource>> createResources(
+        ResponseContext context,
+        ApiCallRcImpl responses,
+        String rscNameStr,
+        Boolean disklessOnRemainingNodes,
+        Set<StorPool> selectedStorPoolSet,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities,
+        List<DeviceLayerKind> layerStackList,
+        @Nullable Integer rscPortCountRef,
+        @Nullable Boolean drbdClientRef
+    )
+    {
+        List<Flux<ApiCallRc>> autoFlux = new ArrayList<>();
+
+        Map<String, String> rscPropsMap = new TreeMap<>();
+
+        // FIXME: createResourceDb expects a list of String instead of a list of deviceLayerKinds...
+        List<String> layerStackStrList = new ArrayList<>();
+        for (DeviceLayerKind kind : layerStackList)
+        {
+            layerStackStrList.add(kind.name());
+        }
+
+        Set<Resource> deployedResources = new TreeSet<>();
+        for (StorPool storPool : selectedStorPoolSet)
+        {
+            String storPoolDisplayName = storPool.getName().displayValue;
+            rscPropsMap.put(ApiConsts.KEY_STOR_POOL_NAME, storPoolDisplayName);
+
+            PairNonNull<List<Flux<ApiCallRc>>, ApiCallRcWith<Resource>> createdRsc = ctrlRscCrtApiHelper
+                .createResourceDb(
+                    storPool.getNode().getName().displayValue,
+                    rscNameStr,
+                    0L,
+                    rscPropsMap,
+                    Collections.emptyList(),
+                    null,
+                    null,
+                    rscPortCountRef,
+                    thinFreeCapacities,
+                    layerStackStrList,
+                    Resource.DiskfulBy.AUTO_PLACER,
+                    drbdClientRef
+                );
+            Resource rsc = createdRsc.objB.extractApiCallRc(responses);
+            autoFlux.addAll(createdRsc.objA);
+            deployedResources.add(rsc);
+        }
+
+        if (disklessOnRemainingNodes != null && disklessOnRemainingNodes)
+        {
+            // TODO: allow other diskless storage pools
+            rscPropsMap.put(ApiConsts.KEY_STOR_POOL_NAME, LinStor.DISKLESS_STOR_POOL_NAME);
+
+            final long rscInitFlags = calculateInitialDisklessFlags(layerStackList, rscNameStr);
+
+            final ResourceName rscName = LinstorParsingUtils.asRscName(rscNameStr);
+
+            // deploy resource disklessly on remaining nodes
+            for (Node disklessNode : nodesMap.values())
+            {
+                @Nullable Resource deployedResource = disklessNode.getResource(rscName);
+                boolean deploy = deployedResource == null ||
+                    deployedResource.getStateFlags().isSet(Resource.Flags.TIE_BREAKER);
+                // only deploy on satellites / combined nodes
+                deploy &= disklessNode.getNodeType().isDeviceProviderKindAllowed(DeviceProviderKind.DISKLESS);
+
+                if (deploy)
+                {
+                    PairNonNull<List<Flux<ApiCallRc>>, ApiCallRcWith<Resource>> createdRsc = ctrlRscCrtApiHelper
+                        .createResourceDb(
+                            disklessNode.getName().displayValue,
+                            rscNameStr,
+                            rscInitFlags,
+                            rscPropsMap,
+                            Collections.emptyList(),
+                            null,
+                            null,
+                            null,
+                            thinFreeCapacities,
+                            layerStackStrList,
+                            null,
+                            true // diskless on remaining are by default client-only (no quorum vote)
+                    );
+                    deployedResources.add(createdRsc.objB.extractApiCallRc(responses));
+                    autoFlux.addAll(createdRsc.objA);
+                }
+            }
+        }
+
+        int idx = 0;
+        var objRefs = new HashMap<String, String>();
+        for (var sp : selectedStorPoolSet)
+        {
+            objRefs.put("Node/" + idx, sp.getNode().getName().displayValue);
+            objRefs.put(
+                String.format("StoragePool/%d/0", idx),
+                sp.getName().toString() + "," + sp.getDeviceProviderKind().toString());
+            idx++;
+        }
+
+        ApiCallRc.RcEntry entry = ApiCallRcImpl
+            .entryBuilder(
+                ApiConsts.CREATED,
+                "Resource '" + rscNameStr + "' successfully autoplaced on " +
+                    selectedStorPoolSet.size() +
+                    " nodes"
+            )
+            .setDetails(
+                "Used nodes (storage pool name): '" +
+                    selectedStorPoolSet.stream().map(
+                            sp -> sp.getNode().getName().displayValue + " (" + sp.getName().displayValue + ")"
+                        )
+                        .collect(Collectors.joining("', '")) + "'")
+            .putAllObjRefs(objRefs)
+            .build();
+
+        responseConverter.addWithOp(responses, context, entry);
+
+        return new PairNonNull<>(autoFlux, deployedResources);
+    }
+
+    /**
+     * Returns the flag value of {@link Resource.Flags#DRBD_DISKLESS}, {@link Resource.Flags#NVME_INITIATOR} or a
+     * bit-wise combination of those two, depending on whether or not DRBD and/or NVME are contained in the layer-stack.
+     * If the given list of {@link DeviceLayerKind}s is empty, the resource-definition is loaded and asked for its
+     * default layer-stack. If that default layer stack is also empty and/or the current resource-count is 0, that would
+     * mean that we have no other resources deployed. This, by definition, makes the
+     * <code>--diskless-on-remaining</code> useless, and thus this method will throw an {@link ApiRcException}.
+     *
+     *
+     */
+    private long calculateInitialDisklessFlags(List<DeviceLayerKind> layerStackListRef, String rscNameStrRef)
+    {
+        final List<DeviceLayerKind> layerStackToUse;
+        if (!layerStackListRef.isEmpty())
+        {
+            layerStackToUse = layerStackListRef;
+        }
+        else
+        {
+            ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscNameStrRef);
+            if (rscDfn.getDiskfulCount() == 0)
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_NOT_FOUND_RSC,
+                        "Cannot place 'diskless-on-remaining' without having diskful resources deployed"
+                    )
+                );
+            }
+            layerStackToUse = rscDfn.getLayerStack();
+        }
+        if (layerStackToUse.isEmpty())
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(ApiConsts.FAIL_INVLD_LAYER_STACK, "Could not find default layer stack")
+            );
+        }
+        final boolean hasDrbd = layerStackToUse.contains(DeviceLayerKind.DRBD);
+        final boolean hasNvme = layerStackToUse.contains(DeviceLayerKind.NVME);
+        return (hasDrbd ? Resource.Flags.DRBD_DISKLESS.flagValue : 0) |
+            (hasNvme ? Resource.Flags.NVME_INITIATOR.flagValue : 0);
+    }
+
+    private boolean isFlagSet(Resource rsc, Resource.Flags... flags)
+    {
+        return rsc.getStateFlags().isSet(flags);
+    }
+
+
+    private boolean hasSkipDiskProp(Resource rsc)
+    {
+        String skipDiskProp = rsc.getProps().getProp(
+            ApiConsts.KEY_DRBD_SKIP_DISK, ApiConsts.NAMESPC_DRBD_OPTIONS);
+        return StringUtils.propTrueOrYes(skipDiskProp);
+    }
+
+    private boolean isSomeFlagSet(Resource rsc, Resource.Flags... flags)
+    {
+        return rsc.getStateFlags().isSomeSet(flags);
+    }
+
+    private boolean isNodeFlagSet(Resource rsc, Node.Flags... flags)
+    {
+        return rsc.getNode().getFlags().isSet(flags);
+    }
+
+    static long calculateResourceDefinitionSize(ResourceDefinition rscDfn)
+    {
+        long size = 0;
+        Iterator<VolumeDefinition> vlmDfnIt = rscDfn.iterateVolumeDfn();
+        while (vlmDfnIt.hasNext())
+        {
+            VolumeDefinition vlmDfn = vlmDfnIt.next();
+            size += vlmDfn.getVolumeSize();
+        }
+        return size;
+
+    }
+
+    private Stream<Resource> privilegedStreamResources(ResourceDefinition rscDfn)
+    {
+        Stream<Resource> ret;
+        ret = rscDfn.streamResource();
+        return ret;
+    }
+
+    private ApiCallRcImpl.ApiCallRcEntry makeAlreadyDeployedResponse(
+        String rscNameStr,
+        List<Resource> alreadyPlaced
+    )
+    {
+        return ApiCallRcImpl
+            .entryBuilder(
+                ApiConsts.WARN_RSC_ALREADY_DEPLOYED,
+                "Resource '" + rscNameStr + "' was already deployed on " +
+                    alreadyPlaced.size() + " nodes. Skipping."
+            )
+            .setDetails("Used nodes: '" +
+                alreadyPlaced.stream().map(rsc -> rsc.getNode().getName().displayValue)
+                    .collect(Collectors.joining("', '")) + "'")
+            .build();
+    }
+
+    private ApiCallRcImpl.ApiCallRcEntry makePlaceCountTooLowResponse(
+        String rscNameStr,
+        List<Resource> alreadyPlaced
+    )
+    {
+        return ApiCallRcImpl.simpleEntry(
+            ApiConsts.WARN_RSC_ALREADY_DEPLOYED,
+            String.format(
+                "The resource '%s' was already deployed on %d nodes: %s. " +
+                    "The resource would have to be deleted from nodes to reach the placement count.",
+                rscNameStr,
+                alreadyPlaced.size(),
+                alreadyPlaced.stream().map(rsc -> "'" + rsc.getNode().getName().displayValue + "'")
+                    .collect(Collectors.joining(", "))
+            ),
+            true
+        );
+    }
+
+    private ApiRcException failNotEnoughCandidates(
+        List<String> storPoolNameList,
+        final long rscSize,
+        AutoSelectFilterApi config
+    )
+    {
+        return new ApiRcException(ApiCallRcImpl
+            .entryBuilder(
+                ApiConsts.FAIL_NOT_ENOUGH_NODES,
+                "Not enough available nodes"
+            )
+            .setDetails(
+                "Not enough nodes fulfilling the following auto-place criteria:\n" +
+                    (
+                    storPoolNameList == null ||
+                        storPoolNameList.isEmpty() ?
+                            "" :
+                            " * has a deployed storage pool named " + storPoolNameList + "\n" +
+                                " * the storage pools have to have at least '" + rscSize +
+                                "' free space\n"
+                    ) +
+                    " * the current access context has enough privileges to use the node and the storage pool\n" +
+                        " * the node is online\n\n" +
+                    "Auto-place configuration details:\n" + config.asHelpString("   ")
+            )
+            .setSkipErrorReport(true)
+            .build()
+        );
+    }
+
+    private static String getObjectDescription(String rscNameStr)
+    {
+        return "Auto-placing resource: " + rscNameStr;
+    }
+
+    private static String getObjectDescriptionInline(String rscNameStr)
+    {
+        return "auto-placing resource: '" + rscNameStr + "'";
+    }
+}

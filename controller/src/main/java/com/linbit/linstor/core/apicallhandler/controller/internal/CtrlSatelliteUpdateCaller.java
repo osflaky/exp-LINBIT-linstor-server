@@ -1,0 +1,634 @@
+package com.linbit.linstor.core.apicallhandler.controller.internal;
+
+import com.linbit.ImplementationError;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.serializer.CtrlStltSerializer;
+import com.linbit.linstor.api.protobuf.ProtoDeserializationUtils;
+import com.linbit.linstor.core.SatelliteConnectorImpl;
+import com.linbit.linstor.core.apicallhandler.controller.internal.helpers.AtomicUpdateSatelliteData;
+import com.linbit.linstor.core.apicallhandler.controller.req.CreateMultiSnapRequest;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.ResponseUtils;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.identifier.StorPoolName;
+import com.linbit.linstor.core.objects.ExternalFile;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.SnapshotDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.objects.remotes.AbsRemote;
+import com.linbit.linstor.core.repository.NodeRepository;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.netcom.PeerNotConnectedException;
+import com.linbit.linstor.proto.common.ApiCallResponseOuterClass.ApiCallResponse;
+import com.linbit.linstor.storage.interfaces.categories.resource.VlmProviderObject;
+import com.linbit.linstor.tasks.RetryResourcesTask;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.util.context.ContextView;
+import reactor.util.function.Tuple2;
+import reactor.util.function.Tuples;
+
+/**
+ * Notifies satellites of updates, returning the responses from the deployment of these changes.
+ */
+@Singleton
+public class CtrlSatelliteUpdateCaller
+{
+    private final CtrlStltSerializer internalComSerializer;
+    private final Provider<RetryResourcesTask> retryResourceTaskProvider;
+    private final SatelliteConnectorImpl stltConnector;
+    private final NodeRepository nodeRepo;
+    private final SatelliteRetcodeDispatcher retcodeDispatcher;
+
+    @Inject
+    private CtrlSatelliteUpdateCaller(
+        CtrlStltSerializer serializerRef,
+        Provider<RetryResourcesTask> retryResourceTaskProviderRef,
+        SatelliteConnectorImpl stltConnectorRef,
+        NodeRepository nodeRepoRef,
+        SatelliteRetcodeDispatcher retcodeDispatcherRef
+    )
+    {
+        internalComSerializer = serializerRef;
+        retryResourceTaskProvider = retryResourceTaskProviderRef;
+        stltConnector = stltConnectorRef;
+        nodeRepo = nodeRepoRef;
+        retcodeDispatcher = retcodeDispatcherRef;
+    }
+
+    /**
+     * Sends node change notifications to the specified satellites.
+     *
+     * @param uuid UUID of changed node
+     * @param nodeName Name of changed node
+     * @param nodesToContact Nodes to update
+     */
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        UUID uuid,
+        NodeName nodeName,
+        Collection<Node> nodesToContact
+    )
+    {
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+
+        byte[] changedMessage = internalComSerializer
+            .headerlessBuilder()
+            .changedNode(
+                uuid,
+                nodeName.displayValue
+            )
+            .build();
+        for (Node nodeToContact : nodesToContact)
+        {
+            Peer peer = nodeToContact.getPeer();
+            if (peer.getConnectionStatus() == ApiConsts.ConnectionStatus.ONLINE)
+            {
+                Flux<ApiCallRc> response = updateSatellite(nodeToContact, changedMessage);
+
+                responses.add(Tuples.of(nodeToContact.getName(), response));
+            }
+        }
+
+        return Flux.fromIterable(responses);
+    }
+
+    private Flux<ApiCallRc> updateSatellite(Node satelliteToUpdate, byte[] changedMessage)
+    {
+        return updateSatellite(satelliteToUpdate, InternalApiConsts.API_CHANGED_NODE, changedMessage);
+    }
+
+    private Flux<ApiCallRc> updateSatellite(Node satelliteToUpdate, String apiCallName, byte[] changedMessage)
+    {
+        Flux<ApiCallRc> response;
+        Peer peer = satelliteToUpdate.getPeer();
+
+        if (peer.isOnline() && peer.hasFullSyncFailed())
+        {
+            response = Flux.error(new ApiRcException(ResponseUtils.makeFullSyncFailedResponse(peer)));
+        }
+        else
+        {
+            NodeName nodeName = satelliteToUpdate.getName();
+
+            response = peer.apiCall(apiCallName, changedMessage)
+                .map(inputStream -> deserializeApiCallRc(nodeName, inputStream))
+                .onErrorMap(
+                    PeerNotConnectedException.class,
+                    ignored -> new ApiRcException(ResponseUtils.makeNotConnectedWarning(nodeName))
+                );
+        }
+
+        return response;
+    }
+
+    /**
+     * See {@link CtrlSatelliteUpdateCaller}.
+     */
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        Resource rsc,
+        Publisher<ApiCallRc> nextStepRef
+    )
+    {
+        return updateSatellites(rsc.getResourceDefinition(), nextStepRef);
+    }
+
+    /**
+     * See {@link CtrlSatelliteUpdateCaller}.
+     */
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        ResourceDefinition rscDfn,
+        @Nullable Publisher<ApiCallRc> nextStepRef
+    )
+    {
+        return Flux.deferContextual(cv -> updateSatellitesWithContext(rscDfn, nextStepRef, cv));
+    }
+
+    private Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellitesWithContext(
+        ResourceDefinition rscDfn,
+        @Nullable Publisher<ApiCallRc> nextStepRef,
+        ContextView cv
+    )
+    {
+        NotConnectedHandler dfltNotConnectedHandler;
+        // TODO move this into context class
+        if (cv.hasKey(InternalApiConsts.ERR_IF_OFFLINE) &&
+            Boolean.TRUE.equals(cv.get(InternalApiConsts.ERR_IF_OFFLINE)))
+        {
+            dfltNotConnectedHandler = notConnectedError();
+        }
+        else
+        {
+            dfltNotConnectedHandler = notConnectedWarn();
+        }
+
+        return updateSatellites(rscDfn, dfltNotConnectedHandler, nextStepRef);
+    }
+
+    /**
+     * See {@link CtrlSatelliteUpdateCaller}.
+     */
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        ResourceDefinition rscDfn,
+        NotConnectedHandler notConnectedHandler,
+        @Nullable Publisher<ApiCallRc> nextStep
+    )
+    {
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+
+        // notify all peers that one of their resources has changed
+        Iterator<Resource> rscIterator = rscDfn.iterateResource();
+        while (rscIterator.hasNext())
+        {
+            Resource currentRsc = rscIterator.next();
+            if (!currentRsc.getNode().isEvicted())
+            {
+                Flux<ApiCallRc> response = updateResource(currentRsc, notConnectedHandler, nextStep);
+
+                responses.add(Tuples.of(currentRsc.getNode().getName(), response));
+            }
+        }
+
+        return Flux.fromIterable(responses);
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellite(final StorPool storPool)
+    {
+        // figure out which nodes to update
+        Set<Node> nodesToUpdate = new HashSet<>();
+        nodesToUpdate.add(storPool.getNode());
+
+        for (VlmProviderObject<Resource> vlmProviderObject : storPool.getVolumes())
+        {
+            ResourceDefinition rscDfn = vlmProviderObject.getRscLayerObject()
+                .getAbsResource()
+                .getResourceDefinition();
+            Iterator<Resource> rscIt = rscDfn.iterateResource();
+            while (rscIt.hasNext())
+            {
+                Resource rsc = rscIt.next();
+                nodesToUpdate.add(rsc.getNode());
+            }
+        }
+
+        return updateSatellite(storPool, nodesToUpdate);
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellite(
+        StorPool storPoolRef,
+        Set<Node> nodesToUpdateRef
+    )
+    {
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+
+        // notify all peers that a storage pool has changed
+        final UUID spUuid = storPoolRef.getUuid();
+        final NodeName nodeName = storPoolRef.getNode().getName();
+        final StorPoolName storPoolName = storPoolRef.getName();
+        for (Node nodeToUpdate : nodesToUpdateRef)
+        {
+            Flux<ApiCallRc> response = updateSatellite(spUuid, nodeName, storPoolName, nodeToUpdate);
+
+            responses.add(Tuples.of(nodeToUpdate.getName(), response));
+        }
+
+        return Flux.fromIterable(responses);
+    }
+
+    public Flux<ApiCallRc> updateSatellite(
+        final UUID storPoolUuid,
+        final NodeName nodeName,
+        final StorPoolName storPoolName,
+        final Node nodeToUpdate
+    )
+    {
+        Flux<ApiCallRc> response;
+
+        Peer peerToUpdate = nodeToUpdate.getPeer();
+
+        if (peerToUpdate.isOnline() && peerToUpdate.hasFullSyncFailed())
+        {
+            response = Flux.error(new ApiRcException(ResponseUtils.makeFullSyncFailedResponse(peerToUpdate)));
+        }
+        else
+        {
+            response = peerToUpdate
+                .apiCall(
+                    InternalApiConsts.API_CHANGED_STOR_POOL,
+                    internalComSerializer
+                        .headerlessBuilder()
+                        .changedStorPool(
+                            storPoolUuid,
+                            nodeName.displayValue,
+                            storPoolName.displayValue
+                        )
+                        .build()
+                )
+
+                .map(inputStream -> deserializeApiCallRc(nodeName, inputStream))
+
+                .onErrorMap(PeerNotConnectedException.class, ignored ->
+                    new ApiRcException(ResponseUtils.makeNotConnectedWarning(nodeName))
+                );
+        }
+
+        return response;
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        SnapshotDefinition snapshotDfn,
+        NotConnectedHandler notConnectedHandler
+    )
+    {
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+
+        // notify all peers that a snapshot has changed
+        for (Snapshot snapshot : snapshotDfn.getAllSnapshots())
+        {
+            Flux<ApiCallRc> response = updateSnapshot(snapshot, notConnectedHandler);
+
+            responses.add(Tuples.of(snapshot.getNodeName(), response));
+        }
+
+        return Flux.fromIterable(responses);
+    }
+
+    private Flux<ApiCallRc> updateResource(
+        Resource currentRsc,
+        NotConnectedHandler notConnectedHandler,
+        @Nullable Publisher<ApiCallRc> nextStepRef
+    )
+    {
+        Node node = currentRsc.getNode();
+        NodeName nodeName = node.getName();
+
+        Flux<ApiCallRc> response;
+        Peer currentPeer = node.getPeer();
+
+        if (currentPeer.isOnline() && currentPeer.hasFullSyncFailed())
+        {
+            response = Flux.error(new ApiRcException(ResponseUtils.makeFullSyncFailedResponse(currentPeer)));
+        }
+        else if (!currentPeer.isOnline())
+        {
+            response = notConnectedHandler.handleNotConnected(nodeName);
+        }
+        else
+        {
+            response = currentPeer
+                .apiCall(
+                    InternalApiConsts.API_CHANGED_RSC,
+                    internalComSerializer
+                        .headerlessBuilder()
+                        .changedResource(
+                            currentRsc.getUuid(),
+                            currentRsc.getResourceDefinition().getName().displayValue
+                        )
+                        .build()
+                )
+
+                .map(inputStream -> deserializeApiCallRc(nodeName, inputStream))
+
+                .transform(retcodeDispatcher.forResource(currentRsc))
+
+                .onErrorResume(
+                    PeerNotConnectedException.class,
+                    ignored ->
+                    {
+                        // Add to retry queue so the update will be retried when the satellite
+                        // becomes available. This must be done here because onErrorResume converts
+                        // the error to a success, so doOnError below won't see it.
+                        retryResourceTaskProvider.get().add(currentRsc, nextStepRef);
+                        return notConnectedHandler.handleNotConnected(nodeName);
+                    }
+                )
+                .doOnError(err ->
+                {
+                    // SatelliteSignalException is the dispatcher's own in-flight retry signal —
+                    // it should never escape, so don't queue. Everything else, *including* the
+                    // dispatcher's own RetcodeRetryExhaustedException, queues for later retry:
+                    // exhaustion conditions (e.g. blocked TCP ports) are often transient and
+                    // each retry round persists discovered constraints (e.g. TcpPortsBlocked),
+                    // so a later attempt picks fresh state and the cluster converges.
+                    if (!retcodeDispatcher.isDispatcherError(err))
+                    {
+                        retryResourceTaskProvider.get().add(currentRsc, nextStepRef);
+                    }
+                });
+        }
+
+        return response;
+    }
+
+    private Flux<ApiCallRc> updateSnapshot(Snapshot snapshot, NotConnectedHandler notConnectedHandler)
+    {
+        Node node = snapshot.getNode();
+        NodeName nodeName = node.getName();
+
+        Flux<ApiCallRc> response;
+        Peer currentPeer = node.getPeer();
+
+        if (currentPeer.isOnline() && currentPeer.hasFullSyncFailed())
+        {
+            response = Flux.error(new ApiRcException(ResponseUtils.makeFullSyncFailedResponse(currentPeer)));
+        }
+        else
+        {
+            response = currentPeer
+                .apiCall(
+                    InternalApiConsts.API_CHANGED_IN_PROGRESS_SNAPSHOT,
+                    internalComSerializer
+                        .headerlessBuilder()
+                        .changedSnapshot(
+                            snapshot.getResourceName().displayValue,
+                            snapshot.getUuid(),
+                            snapshot.getSnapshotName().displayValue
+                        )
+                        .build()
+                )
+
+                .map(inputStream -> deserializeApiCallRc(nodeName, inputStream))
+                .onErrorResume(
+                    PeerNotConnectedException.class,
+                    ignored -> notConnectedHandler.handleNotConnected(nodeName)
+                );
+        }
+        return response;
+    }
+
+    public static ApiCallRc deserializeApiCallRc(NodeName nodeName, ByteArrayInputStream inputStream)
+    {
+        ApiCallRcImpl deploymentState = new ApiCallRcImpl();
+
+        try
+        {
+            while (inputStream.available() > 0)
+            {
+                ApiCallResponse apiCallResponse = ApiCallResponse.parseDelimitedFrom(inputStream);
+                deploymentState.addEntry(ProtoDeserializationUtils.parseApiCallRc(
+                    apiCallResponse, "(" + nodeName.displayValue + ") "
+                ));
+            }
+        }
+        catch (IOException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+
+        return deploymentState;
+    }
+
+    @FunctionalInterface
+    public interface NotConnectedHandler
+    {
+        Flux<ApiCallRc> handleNotConnected(NodeName nodeName);
+    }
+
+    public static NotConnectedHandler notConnectedWarn()
+    {
+        return nodeName -> Flux.just(new ApiCallRcImpl(ResponseUtils.makeNotConnectedWarning(nodeName)));
+    }
+
+    public static NotConnectedHandler notConnectedIgnoreIf(NodeName toggleNode)
+    {
+        return nodeName -> nodeName.equals(toggleNode) ?
+            Flux.empty() : Flux.error(new ApiRcException(ResponseUtils.makeNotConnectedWarning(nodeName)));
+    }
+
+    public static NotConnectedHandler notConnectedIgnoreIfNot(NodeName toggleNode)
+    {
+        return nodeName -> nodeName.equals(toggleNode) ?
+            Flux.error(new ApiRcException(ResponseUtils.makeNotConnectedWarning(nodeName))) : Flux.empty();
+    }
+
+    public static NotConnectedHandler notConnectedErrorForNodesWarnForOthers(NodeName... errorNodeNames)
+    {
+        return nodeName -> {
+            Flux<ApiCallRc> ret;
+            boolean error = false;
+            for (NodeName errNodeName : errorNodeNames)
+            {
+                if (nodeName.equals(errNodeName))
+                {
+                    error = true;
+                    break;
+                }
+            }
+            if (error)
+            {
+                ret = Flux.error(new ApiRcException(ResponseUtils.makeNotConnectedWarning(nodeName)));
+            }
+            else
+            {
+                ret = Flux.just(new ApiCallRcImpl(ResponseUtils.makeNotConnectedWarning(nodeName)));
+            }
+            return ret;
+
+        };
+    }
+
+    public static NotConnectedHandler notConnectedError()
+    {
+        return nodeName -> Flux.error(new ApiRcException(ApiCallRcImpl.simpleEntry(
+            ApiConsts.FAIL_NOT_CONNECTED,
+            "No connection to satellite '" + nodeName + "'",
+            true
+        )));
+    }
+
+    public Flux<Boolean> attemptConnecting(Node nodeRef, long timeoutMillis)
+    {
+        Object key = new Object();
+        return Flux.<Boolean>create(fluxSink ->
+            {
+                nodeRef.registerInitialConnectSink(key, fluxSink);
+                stltConnector.startConnecting(nodeRef, false, key);
+            }
+        )
+            .timeout(
+                Duration.ofMillis(timeoutMillis),
+                Flux.just(false)
+            )
+            .doFinally(ignoredSignal -> nodeRef.removeInitialConnectSink(key));
+    }
+
+    public Flux<ApiCallRc> updateSatellite(ExternalFile extFileRef)
+    {
+        return Flux.merge(
+            updateAllSatellites(
+                InternalApiConsts.API_CHANGED_EXTERNAL_FILE,
+                internalComSerializer.headerlessBuilder()
+                    .changedExtFile(extFileRef.getUuid(), extFileRef.getName().extFileName)
+                    .build()
+            ).map(tuple -> tuple.getT2())
+        );
+    }
+
+    public Flux<ApiCallRc> updateSatellites(AbsRemote remoteRef)
+    {
+        return Flux.merge(
+            updateAllSatellites(
+                InternalApiConsts.API_CHANGED_REMOTE,
+                internalComSerializer.headerlessBuilder()
+                    .changedRemote(remoteRef.getUuid(), remoteRef.getName().displayValue)
+                    .build()
+            ).map(tuple -> tuple.getT2())
+        );
+    }
+
+    public Flux<ApiCallRc> updateSatellitesConf()
+    {
+        return Flux.merge(
+            updateAllSatellites(
+                InternalApiConsts.API_CHANGED_CONTROLLER,
+                internalComSerializer.headerlessBuilder()
+                    .build()
+            ).map(Tuple2::getT2)
+        );
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateAllSatellites(String apiChangedNodeRef, byte[] message)
+    {
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+        for (Node nodeToContact : nodeRepo.getMapForView().values())
+        {
+            Peer satellitePeer = nodeToContact.getPeer();
+
+            if (satellitePeer.isOnline() && !satellitePeer.hasFullSyncFailed())
+            {
+                Flux<ApiCallRc> response = updateSatellite(
+                    nodeToContact,
+                    apiChangedNodeRef,
+                    message
+                );
+
+                responses.add(Tuples.of(nodeToContact.getName(), response));
+            }
+        }
+        return Flux.fromIterable(responses);
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        CreateMultiSnapRequest reqRef,
+        NotConnectedHandler notConnectedErrorRef
+    )
+    {
+        return updateSatellites(
+            new AtomicUpdateSatelliteData().addSnapDfns(reqRef.getCreatedSnapDfns()),
+            notConnectedErrorRef
+        );
+    }
+
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        AtomicUpdateSatelliteData atomicUpdateDataRef,
+        NotConnectedHandler notConnectedErrorRef
+    )
+    {
+        return updateSatellites(
+            atomicUpdateDataRef.getInvolvedOnlineNodes(),
+            atomicUpdateDataRef,
+            notConnectedErrorRef
+        );
+    }
+
+    /**
+     * Sends the atomic update to all given nodes.
+     *
+     * Different AtomicUpdates to different nodes must be handled outside of this class (or we need a new method for
+     * that which uses something like {@code Map<Node, AtomitUpdateSatelliteData>})
+     */
+    public Flux<Tuple2<NodeName, Flux<ApiCallRc>>> updateSatellites(
+        Collection<Node> nodesRef,
+        AtomicUpdateSatelliteData atomicUpdateDataRef,
+        NotConnectedHandler notConnectedHandler
+    )
+    {
+        byte[] changedMessage = internalComSerializer.headerlessBuilder()
+            .changedData(atomicUpdateDataRef)
+            .build();
+        List<Tuple2<NodeName, Flux<ApiCallRc>>> responses = new ArrayList<>();
+        for (Node node : nodesRef)
+        {
+            Peer peer = node.getPeer();
+            if (peer.getConnectionStatus() == ApiConsts.ConnectionStatus.ONLINE)
+            {
+                NodeName nodeName = node.getName();
+
+                Flux<ApiCallRc> response = updateSatellite(
+                    node,
+                    InternalApiConsts.API_CHANGED_DATA,
+                    changedMessage
+                ).onErrorResume(
+                    PeerNotConnectedException.class,
+                    ignored -> notConnectedHandler.handleNotConnected(nodeName)
+                );
+                // TODO we should also consider adding a retryTask for atomic updates
+
+                responses.add(Tuples.of(nodeName, response));
+            }
+        }
+        return Flux.fromIterable(responses);
+    }
+}

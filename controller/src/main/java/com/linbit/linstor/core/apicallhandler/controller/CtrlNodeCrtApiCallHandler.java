@@ -1,0 +1,317 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.SizeSpecParser;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiCallRcImpl.ApiCallRcEntry;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.rest.v1.events.EventNodeHandlerBridge;
+import com.linbit.linstor.core.CtrlAuthenticator;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.autoplacer.Autoplacer;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.apicallhandler.response.ResponseUtils;
+import com.linbit.linstor.core.apis.NetInterfaceApi;
+import com.linbit.linstor.core.identifier.NetInterfaceName;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.remotes.AbsRemote;
+import com.linbit.linstor.core.objects.remotes.EbsRemote;
+import com.linbit.linstor.core.types.LsIpAddress;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.storage.kinds.DeviceProviderKind;
+import com.linbit.linstor.tasks.ReconnectorTask;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import reactor.core.publisher.Flux;
+
+@Singleton
+public class CtrlNodeCrtApiCallHandler
+{
+    public static final int FIRST_CONNECT_TIMEOUT_MILLIS = 1_000;
+
+    private final ErrorReporter errorReporter;
+    private final ScopeRunner scopeRunner;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final ResponseConverter responseConverter;
+    private final LockGuardFactory lockGuardFactory;
+    private final CtrlNodeApiCallHandler ctrlNodeApiCallHandler;
+    private final CtrlStorPoolCrtApiCallHandler ctrlStorPoolCrtHandler;
+    private final Provider<CtrlAuthenticator> ctrlAuthenticator;
+    private final ReconnectorTask reconnectorTask;
+    private final EventNodeHandlerBridge eventNodeHandlerBridge;
+    private final CtrlApiDataLoader dataLoader;
+
+    @Inject
+    public CtrlNodeCrtApiCallHandler(
+        ErrorReporter errorReporterRef,
+        ScopeRunner scopeRunnerRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        ResponseConverter responseConverterRef,
+        LockGuardFactory lockGuardFactoryRef,
+        CtrlNodeApiCallHandler ctrlNodeApiCallHandlerRef,
+        CtrlStorPoolCrtApiCallHandler ctrlStorPoolCrtHandlerRef,
+        Provider<CtrlAuthenticator> ctrlAuthenticatorRef,
+        ReconnectorTask reconnectorTaskRef,
+        EventNodeHandlerBridge eventNodeHandlerBridgeRef,
+        CtrlApiDataLoader dataLoaderRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        scopeRunner = scopeRunnerRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        responseConverter = responseConverterRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        ctrlNodeApiCallHandler = ctrlNodeApiCallHandlerRef;
+        ctrlStorPoolCrtHandler = ctrlStorPoolCrtHandlerRef;
+        ctrlAuthenticator = ctrlAuthenticatorRef;
+        reconnectorTask = reconnectorTaskRef;
+        eventNodeHandlerBridge = eventNodeHandlerBridgeRef;
+        dataLoader = dataLoaderRef;
+    }
+
+    /**
+     * Attempts to create a node by the given parameters. <br />
+     * <br />
+     * In any case an {@link ApiCallRc} is returned. The list of {@link ApiCallRcEntry}s describe the success
+     * or failure of the operation. <br />
+     * <br />
+     * All return codes from this method are masked with {@link ApiConsts#MASK_NODE} and
+     * {@link ApiConsts#MASK_CRT}.<br />
+     * <br />
+     * Following return codes can be returned:
+     * <ul>
+     *  <li>
+     *      {@link ApiConsts#FAIL_ACC_DENIED_NODE} when the current access context does have enough privileges to
+     *      change any nodes at all (controller.nodesMapLockProt)
+     *  </li>
+     *  <li>{@link ApiConsts#FAIL_MISSING_NETCOM} when the list of network interface apis is empty</li>
+     *  <li>
+     *      {@link ApiConsts#FAIL_INVLD_NET_NAME} when the list of network interface apis contains an invalid
+     *      {@link NetInterfaceName}
+     *  </li>
+     *  <li>
+     *      {@link ApiConsts#FAIL_INVLD_NET_ADDR} when the list of network interface apis contains an invalid
+     *      {@link LsIpAddress}
+     *  </li>
+     *  <li>{@link ApiConsts#FAIL_MISSING_STLT_CONN} when the list of satellite connection apis is empty</li>
+     *  <li>{@link ApiConsts#FAIL_INVLD_NODE_NAME} when the {@link NodeName} is invalid</li>
+     *  <li>{@link ApiConsts#FAIL_INVLD_NODE_TYPE} when the {@link Type} is invalid</li>
+     *  <li>{@link ApiConsts#CREATED} when the node was created successfully </li>
+     * </ul>
+     *
+     */
+    public Flux<ApiCallRc> createNode(
+        String nodeNameStr,
+        String nodeTypeStr,
+        List<NetInterfaceApi> netIfs,
+        Map<String, String> propsMap
+    )
+    {
+        ResponseContext context = CtrlNodeApiCallHandler.makeNodeContext(
+            ApiOperation.makeCreateOperation(),
+            nodeNameStr
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Create node",
+            lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.NODES_MAP),
+            () -> createNodeInTransaction(context, nodeNameStr, nodeTypeStr, netIfs, propsMap)
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+
+    private Flux<ApiCallRc> createNodeInTransaction(
+        ResponseContext context,
+        String nodeNameStr,
+        String nodeTypeStr,
+        List<NetInterfaceApi> netIfs,
+        Map<String, String> propsMap
+    )
+    {
+        Flux<ApiCallRc> flux;
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+
+        Node node;
+        Node.Type nodeType = LinstorParsingUtils.asNodeType(nodeTypeStr);
+
+        checkProps(propsMap);
+
+        if (nodeType.isSpecial())
+        {
+            node = ctrlNodeApiCallHandler.createSpecialSatellite(
+                nodeNameStr,
+                nodeTypeStr,
+                propsMap
+            ).extractApiCallRc(responses);
+        }
+        else
+        {
+            node = ctrlNodeApiCallHandler.createNodeImpl(
+                nodeNameStr,
+                nodeTypeStr,
+                netIfs,
+                propsMap,
+                responses,
+                context,
+                false,
+                true
+            );
+        }
+
+        eventNodeHandlerBridge.triggerNodeCreate(node.getApiData(null, null));
+
+        flux = Flux.just(responses);
+        flux = flux.concatWith(connectNow(node));
+        return flux;
+    }
+
+    private void checkProps(Map<String, String> propsMap)
+    {
+        @Nullable String minFreeSpaceValue = propsMap.get(Autoplacer.MIN_FREE_SPACE_PROP);
+        if (minFreeSpaceValue != null)
+        {
+            SizeSpecParser.ensureParsableWithPercent(minFreeSpaceValue);
+        }
+    }
+
+    public Flux<ApiCallRc> createEbsNode(
+        String nodeNameStr,
+        String ebsRemoteNameRef
+    )
+    {
+        ResponseContext context = CtrlNodeApiCallHandler.makeNodeContext(
+            ApiOperation.makeCreateOperation(),
+            nodeNameStr
+        );
+
+        return scopeRunner.fluxInTransactionalScope(
+            "Create EBS node",
+            lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.NODES_MAP, LockObj.STOR_POOL_DFN_MAP),
+            () -> createEbsNodeInTransaction(
+                nodeNameStr,
+                ebsRemoteNameRef
+            )
+        ).transform(responses -> responseConverter.reportingExceptions(context, responses));
+    }
+
+    private Flux<ApiCallRc> createEbsNodeInTransaction(
+        String nodeNameStrRef,
+        String ebsRemoteNameStrRef
+    )
+    {
+        Flux<ApiCallRc> flux;
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+        AbsRemote remote = dataLoader.loadRemote(ebsRemoteNameStrRef);
+        if (!(remote instanceof EbsRemote))
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_EXISTS_REMOTE,
+                    "The remote with the name '" + ebsRemoteNameStrRef +
+                        "' is not a EBS remote."
+                )
+            );
+        }
+        Node node;
+        node = ctrlNodeApiCallHandler.createSpecialSatellite(
+            nodeNameStrRef,
+            Node.Type.EBS_TARGET.name(),
+            Collections.emptyMap()
+        ).extractApiCallRc(responses);
+
+        Flux<ApiCallRc> createStorPoolFlux = ctrlStorPoolCrtHandler.createStorPool(
+            nodeNameStrRef,
+            InternalApiConsts.EBS_DFTL_STOR_POOL_NAME,
+            DeviceProviderKind.EBS_TARGET,
+            null,
+            false,
+            Collections.singletonMap(
+                ApiConsts.NAMESPC_STORAGE_DRIVER + "/" + ApiConsts.NAMESPC_EBS + "/" +
+                    ApiConsts.KEY_REMOTE,
+                ebsRemoteNameStrRef
+            ),
+            Flux.empty()
+        );
+
+        ctrlTransactionHelper.commit();
+
+        eventNodeHandlerBridge.triggerNodeCreate(node.getApiData(null, null));
+
+        flux = Flux.<ApiCallRc>just(responses)
+            .log()
+            .concatWith(connectNow(node))
+            .log()
+            .concatWith(createStorPoolFlux);
+        return flux;
+    }
+
+    public Flux<ApiCallRc> connectNow(Node node)
+    {
+        Flux<ApiCallRc> flux;
+        Node.Type nodeType = node.getNodeType();
+
+        if (!Node.Type.CONTROLLER.equals(nodeType) &&
+            !Node.Type.AUXILIARY.equals(nodeType))
+        {
+            flux = ctrlSatelliteUpdateCaller.attemptConnecting(
+                node,
+                FIRST_CONNECT_TIMEOUT_MILLIS
+            )
+                .concatMap(connected -> processConnectingResponse(node, connected));
+        }
+        else
+        {
+            errorReporter.logInfo(
+                "Not connecting to node '%s' due to its node-type: %s",
+                node.getName(),
+                nodeType.name()
+            );
+            node.setOfflinePeer(errorReporter);
+            flux = Flux.empty();
+        }
+        return flux;
+    }
+
+    private Flux<ApiCallRc> processConnectingResponse(Node node, boolean connected)
+    {
+        Flux<ApiCallRc> connectedFlux;
+        if (connected)
+        {
+            connectedFlux = ctrlAuthenticator.get()
+                .completeAuthentication(node);
+        }
+        else
+        {
+            connectedFlux = Flux.just(
+                ApiCallRcImpl.singletonApiCallRc(
+                    ResponseUtils.makeNotConnectedWarning(
+                        node.getName()
+                    )
+                )
+            );
+            reconnectorTask.add(node.getPeer(), false);
+        }
+        return connectedFlux;
+    }
+}

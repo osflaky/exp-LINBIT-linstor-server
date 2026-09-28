@@ -1,0 +1,476 @@
+spec:
+  inputs:
+    virter_version:
+      type: string
+      default: v1.2.1
+      description: virter version to use
+    vmshed_version:
+      type: string
+      default: v0.29.0
+      description: vmshed version to use
+    build_helpers_version:
+      type: string
+      default: bbebcdb3f5f69354111219750b347d30f81f41a9
+      description: build-helpers version or tag to use
+    vmshed_torun:
+      type: string
+      default: "all"
+      description: "list of named tests to run, `all` means all :D"
+    vmshed_variants:
+      type: string
+      default: auto
+      description: "which variant(s) to run, or `auto`: standard when torun=all, otherwise default (matches every H2 test); e.g. `--variant crd`"
+    vmshed_print_error_details:
+      type: boolean
+      default: false
+      description: "Show all test error logs at the end of the run"
+    linstor_test_repeats:
+      type: number
+      default: 1
+      description: How often to repeat each run
+    distributions:
+      type: string
+      default: ubuntu-focal,ubuntu-jammy,ubuntu-noble,rhel8.0,rhel9.0,rhel10.0,debian-trixie
+      description: "which distributions to build for"
+    ci_e2e_timeout:
+      type: string
+      default: 90 minutes
+      description: "timeout for the CI e2e tests"
+    ci_remove_success_logs:
+      type: boolean
+      default: false
+      description: "Removes vm logs from successful tests before creating the artifact"
+
+---
+image: $LINBIT_DOCKER_REGISTRY/build-helpers:$[[ inputs.build_helpers_version ]]
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+  # Source branch glob of MRs whose rebase-only pipelines may skip the e2e tests, see .common_e2e
+  E2E_SKIP_REBASE_BRANCHES: "renovate/*"
+  RUNNER_TAG_LIBVIRT: "libvirt"
+  LINBIT_CI_MAX_CPUS: 38  # limit memory usage (limit 84GB) on default runners 38 * 2 + 7(vmshed/virter...)
+  GRADLE_USER_HOME: $CI_PROJECT_DIR/.gradle
+
+# Opt-in Gradle cache: only reference this from jobs that actually run Gradle,
+# so all other jobs (e2e on libvirt runners, deploy, scans) don't fill their
+# runner's disk with it.
+.gradle-cache:
+  cache:
+    key:
+      files:
+        - build.gradle
+        - gradle.lockfile
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+      - tools
+
+stages:
+  - build
+  - test
+  - deploy
+  - integration
+  - integration-all
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'jenkins'
+      variables:
+        RUNNER_TAG_LIBVIRT: "libvirt-xl"
+        LINBIT_CI_MAX_CPUS: 64  # enough memory on xl runners
+    - if: $CI_COMMIT_BRANCH == 'master'
+      variables:
+        RUNNER_TAG_LIBVIRT: "libvirt-xl"
+        LINBIT_CI_MAX_CPUS: 64  # enough memory on xl runners
+    - when: always  # Other pipelines can run, but use the default variables
+
+.run_lbbuild:
+  cache: !reference [.gradle-cache, cache]
+  script:
+# build spacetracking
+    - |
+      ST_BRANCH="master"
+      if git ls-remote https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.at.linbit.com/linstor/linstor-server-spacetracking.git | grep refs/heads/${CI_COMMIT_REF_NAME} ; then
+        ST_BRANCH=${CI_COMMIT_REF_NAME}
+      fi
+    - echo "Using ST-Branch ${ST_BRANCH}"
+    - git clone --single-branch --branch ${ST_BRANCH} --recursive https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.at.linbit.com/linstor/linstor-server-spacetracking.git linstor-spacetracking
+    - cd linstor-spacetracking
+    - git remote add linstor https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.at.linbit.com/linstor/linstor-server.git
+    - git fetch linstor --recurse-submodules=no
+    - git config --global user.email "fake@example.com"
+    - git config --global user.name "Faker"
+    - git rebase $CI_COMMIT_SHORT_SHA
+    - git submodule update
+    - ./gradlew getProtoc && ./gradlew installdist
+    - ./gradlew getproguard
+    - make obfuscate-spacetracking
+    - mkdir ../libs
+    - cp satellite-st/build/libs/satellite-st.jar ../libs/
+    - cp controller-st/build/libs/controller-st.jar ../libs/
+    - cp server-st/build/libs/server-st.jar ../libs/
+    - cd ..
+    - rm -Rf linstor-spacetracking
+# normal linstor build
+    - dummy-release.sh linstor-server $LINSTOR_VERSION 1 linstor.spec
+    - FORCE=1 VERSION=$LINSTOR_VERSION make debrelease
+    - . gitlab-utils.sh
+    - ci_prepare_tools
+    - pulp file content upload --repository lbbuild-upstream --file linstor-server-$LINSTOR_VERSION.tar.gz --relative-path linstor-server-$LINSTOR_VERSION.tar.gz
+    - lbbuildctl build linstor-server --arch amd64 --ci -v "$LINSTOR_VERSION"
+      -e LINBIT_REGISTRY_USER=$LINBIT_REGISTRY_USER
+      -e LINBIT_REGISTRY_PASSWORD=$LINBIT_REGISTRY_PASSWORD
+      -e LINBIT_REGISTRY_URL=$LINBIT_REGISTRY_URL
+      -d $[[ inputs.distributions ]]
+    - |
+      IFS="," read -ra ALL_DISTS <<< $[[ inputs.distributions ]]
+      echo "distributions:"
+      for dist in "${ALL_DISTS[@]}"; do
+        if [[ ${dist} == rhel* ]] ; then
+          echo "  ${dist%%.*}:"
+          for linstor_comp in linstor-controller linstor-satellite linstor-common; do
+            echo "    ${linstor_comp/-/_}: \"https://pulp.at.linbit.com/pulp/content/rpm/${dist%%.*}/Packages/l/${linstor_comp}-${LINSTOR_VERSION}-1.noarch.rpm\""
+          done
+        elif [[ ${dist} == ubuntu* || ${dist} == debian* ]] ; then
+        echo "  ${dist/-/_}:"
+          for linstor_comp in linstor-controller linstor-satellite linstor-common; do
+            echo "    ${linstor_comp/-/_}: \"https://pulp.at.linbit.com/pulp/content/deb/${dist}/pool/upload/l/linstor-server/${linstor_comp}_${LINSTOR_VERSION}-1_all.deb\""
+          done
+        else
+          echo "unknown distribution: ${dist}"
+        fi
+      done
+    - rm linstor-server-$LINSTOR_VERSION.tar.gz
+    - |
+      for sha in $(pulp file repository content list --repository lbbuild-upstream | jq -r ".[] | select(.relative_path==\"linstor-server-$LINSTOR_VERSION.tar.gz\") | .sha256"); do
+        pulp file repository content remove --repository lbbuild-upstream --relative-path linstor-server-$LINSTOR_VERSION.tar.gz --sha256 $sha
+      done
+
+.common_e2e:
+  script:
+# Rebase-only pipelines: for MRs whose source branch matches E2E_SKIP_REBASE_BRANCHES (currently only renovate MRs),
+# skip the e2e run if the code diff of this MR (CHANGELOG.md excluded) is identical to the one already tested by the
+# last successful pipeline of this MR. The job then exits with 42, which the e2e jobs list as an allowed failure, so
+# it shows up as "passed with warnings". Set FORCE_E2E=1 to run the tests anyway.
+    - |
+      mkdir -p tests-out
+      case "$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME" in
+        $E2E_SKIP_REBASE_BRANCHES) E2E_SKIP_ALLOWED=1 ;;
+        *) E2E_SKIP_ALLOWED= ;;
+      esac
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ] && [ -n "$E2E_SKIP_ALLOWED" ] && [ -z "$FORCE_E2E" ] &&
+         git fetch -q --depth=1 origin "$CI_MERGE_REQUEST_DIFF_BASE_SHA"; then
+        PATCH_ID=$(git diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" HEAD -- . ':(exclude)CHANGELOG.md' | git patch-id --stable | cut -d' ' -f1)
+        printf '%s\n' "$CI_JOB_NAME:${PATCH_ID:-empty}" "$CI_JOB_URL" > tests-out/e2e-patch-id
+        PREV=$(curl -sf -G --header "JOB-TOKEN: $CI_JOB_TOKEN" --data-urlencode "job=$CI_JOB_NAME" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/jobs/artifacts/refs/merge-requests/$CI_MERGE_REQUEST_IID/head/raw/tests-out/e2e-patch-id" || true)
+        if [ -n "$PREV" ] && [ "$(printf '%s\n' "$PREV" | sed -n 1p)" = "$(sed -n 1p tests-out/e2e-patch-id)" ]; then
+          TESTED_JOB=$(printf '%s\n' "$PREV" | sed -n 2p)
+          echo
+          echo "=================================================================================="
+          echo " E2E TESTS SKIPPED: nothing new to test"
+          echo
+          echo " The code diff of this MR (CHANGELOG.md excluded) is identical to the one that"
+          echo " already passed this job in an earlier pipeline of this MR, i.e. the branch was"
+          echo " only rebased. The tests were NOT run again in this job, which is therefore"
+          echo " marked as 'passed with warnings'."
+          echo
+          echo " Tested by: $TESTED_JOB"
+          echo " Patch-id:  ${PATCH_ID:-empty}"
+          echo
+          echo " To force a full run, start the pipeline with the variable FORCE_E2E=1."
+          echo "=================================================================================="
+          echo
+          printf '%s\n' "$PREV" > tests-out/e2e-patch-id
+          exit 42
+        fi
+        echo "Code diff differs from the last tested one (or none found), running e2e tests"
+      fi
+    - IMAGE_NAME=$LINBIT_DOCKER_REGISTRY/linstor-tests:latest
+    - |
+      SAFE_REF_NAME=${CI_COMMIT_REF_SLUG}
+      if docker image pull $LINBIT_DOCKER_REGISTRY/linstor-tests:$SAFE_REF_NAME ; then
+          TEST_BRANCH=$SAFE_REF_NAME
+          IMAGE_NAME=$LINBIT_DOCKER_REGISTRY/linstor-tests:$SAFE_REF_NAME
+      else
+          docker image pull $IMAGE_NAME
+      fi
+# copy virter files out from the docker image (replaces old bundle)
+    - |
+      CID=$(docker create $IMAGE_NAME)
+      docker cp $CID:/linstor-tests/virter ./
+      docker rm -v $CID
+    - |
+      mkdir build-helpers
+      BUILD_HELPERS_VERSION=$[[ inputs.build_helpers_version ]]
+      PULP_FILES_URL=https://pulp.at.linbit.com/pulp/content/file
+      curl -sSfL $PULP_FILES_URL/test-suite/build-helpers-$BUILD_HELPERS_VERSION.tar.gz | tar -xvz -C ./build-helpers
+      . build-helpers/gitlab-utils.sh
+    - |
+      ci_prepare_tools
+      ci_fetch_rq
+      VIRTER_VERSION=$[[ inputs.virter_version ]]
+      VMSHED_VERSION=$[[ inputs.vmshed_version ]]
+      ci_fetch_binary virter virter-$VIRTER_VERSION https://github.com/LINBIT/virter/releases/download/$VIRTER_VERSION/virter-linux-amd64
+      ci_fetch_binary vmshed vmshed-$VMSHED_VERSION https://github.com/LINBIT/vmshed/releases/download/$VMSHED_VERSION/vmshed-linux-amd64
+    - |
+      VARIANTS="${TMP_VARIANTS:-$[[ inputs.vmshed_variants ]]}"
+      if [ "$VARIANTS" = "auto" ]; then
+        if [ "$[[ inputs.vmshed_torun ]]" = "all" ]; then
+          VARIANTS="--variant standard"
+        else
+          VARIANTS="--variant default"
+        fi
+      fi
+# --- is used because of bash
+    - echo "Running variants $VARIANTS"
+    - echo "LINSTOR-TEST BRANCH = $TEST_BRANCH"
+    - export LINSTOR_VERSION=1.99.0.$CI_COMMIT_SHORT_SHA
+    - export LINSTOR_TESTS_VERSION=$TEST_BRANCH
+    - export LINBIT_CI_JOB_ID=$CI_JOB_ID
+    - export LINBIT_CI_REMOVE_SUCCESS_LOGS=$[[ inputs.ci_remove_success_logs ]]
+    - ./virter/run-test.py $VARIANTS --torun $[[ inputs.vmshed_torun ]] --repeats="$[[ inputs.linstor_test_repeats ]]" --error-details=$[[ inputs.vmshed_print_error_details ]]
+
+check-openapi:
+  stage: build
+  interruptible: true
+  image:
+    name: ibmdevxsdk/openapi-validator:1.37.11
+    entrypoint: [""] # force empty entrypoint to workaround a gitlab issue
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "web"'
+      changes:
+        - docs/rest_v1_openapi.yaml
+        - docs/.spectral.yaml
+  before_script:
+    - echo default before disabled
+  script:
+    - cd docs
+    - lint-openapi -e rest_v1_openapi.yaml
+
+check-resttypes:
+  stage: build
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+    - if: $CI_COMMIT_BRANCH == "master"
+  before_script:
+    - echo "checking if JsonGenTypes.java is up-to-date"
+  script:
+    - make resttypes
+    # exits with 1 if a difference is found, and also shows it
+    - git diff --exit-code
+
+check-package-info:
+  stage: build
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+    - if: $CI_COMMIT_BRANCH == "master"
+  before_script:
+    - echo "checking package-info.java"
+  script:
+    - ret=0
+    - |
+      function check_package_info() {
+        for f in ${1}/*; do
+           if [ -d "${f}" ]; then
+             if ls ${f}/*.java 1> /dev/null 2>&1; then
+               # this folder contains at least 1 .java file
+               if [ ! -f ${f}/package-info.java ]; then
+                 ret=1
+                 echo -e "\x1b[31;mno package-info.java in \x1b[0m${f}"
+               fi
+             fi
+             check_package_info ${f}
+           fi
+         done
+      }
+    - |
+      for entry in ./{.,controller,satellite,server}/src/main/java; do
+        check_package_info ${entry}
+      done
+    - exit ${ret}
+
+
+test:
+  stage: test
+  interruptible: true
+  cache: !reference [.gradle-cache, cache]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+  script:
+    - ./gradlew getProtoc
+    - ./gradlew -PversionOverride= checkstyleMain
+    - ./gradlew -PversionOverride= assemble
+    - JAVA_OPTS="-ea" ./gradlew -PversionOverride= -PCoverageReport=true test
+    - awk -F"," '{ instructions += $4 + $5; covered += $5 } END { print "Total", 100*covered/instructions, "% covered" }' build/reports/jacoco/test/jacocoTestReport.csv
+  coverage: '/Total (\d+.\d+) % covered/'
+  artifacts:
+    reports:
+      junit: "**/build/test-results/test/TEST-*.xml"
+      coverage_report:
+        coverage_format: jacoco
+        path: build/reports/jacoco/test/jacocoTestReport.xml
+    paths:
+      - build/distributions/linstor-server.tar
+    expire_in: 4 days
+
+deploy:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  before_script:
+    - echo "DEPLOY"
+  script:
+    - cp Dockerfile.test-controller Dockerfile
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY/linstor/linstor-server/controller:latest .
+    - docker push $CI_REGISTRY/linstor/linstor-server/controller:latest
+  tags:
+    - shell
+
+run-lbbuild-master:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'master'
+  before_script:
+    - curl -sSfL https://pulp.at.linbit.com/pulp/content/file/lbbuild/lbbuildctl-latest -o /usr/local/bin/lbbuildctl
+    - chmod +x /usr/local/bin/lbbuildctl
+  variables:
+    LINSTOR_VERSION: 1.99.0.latest
+  extends: .run_lbbuild
+
+run-lbbuild:
+  stage: deploy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == 'master'
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+  before_script:
+    - curl -sSfL https://pulp.at.linbit.com/pulp/content/file/lbbuild/lbbuildctl-latest -o /usr/local/bin/lbbuildctl
+    - chmod +x /usr/local/bin/lbbuildctl
+  variables:
+    LINSTOR_VERSION: 1.99.0.$CI_COMMIT_SHORT_SHA
+  extends: .run_lbbuild
+
+test-e2e-all:
+  stage: integration-all
+  interruptible: true
+  allow_failure:
+    exit_codes: 42  # e2e skipped on rebase-only pipeline, see .common_e2e
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - libvirt
+  parallel:
+    matrix:
+      - TMP_VARIANTS: ["--variant nonstandard-1", "--variant nonstandard-2"]
+  before_script:
+    - echo "no before"
+  script:
+    - TEST_BRANCH=latest
+    - !reference [.common_e2e, script]
+  artifacts:
+    # provide a convenient name so that the downloaded artifacts can be identified
+    name: $CI_PROJECT_NAME-$CI_JOB_ID
+    paths:
+      - tests-out/
+    when: always
+    reports:
+      junit: tests-out/test-results/*.xml
+
+test-e2e:
+  stage: integration
+  interruptible: true
+  allow_failure:
+    exit_codes: 42  # e2e skipped on rebase-only pipeline, see .common_e2e
+  timeout: $[[ inputs.ci_e2e_timeout ]]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+      variables:
+        TMP_VARIANTS: "--variant default --variant crd"
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PIPELINE_SOURCE == "push"'
+      variables:
+        TMP_VARIANTS: "--variant default"
+  tags:
+    - $RUNNER_TAG_LIBVIRT
+  before_script:
+    - echo "no before"
+  script:
+    - TEST_BRANCH=latest
+    - !reference [.common_e2e, script]
+  artifacts:
+    # provide a convenient name so that the downloaded artifacts can be identified
+    name: $CI_PROJECT_NAME-$CI_JOB_ID
+    paths:
+      - tests-out/
+    when: always
+    reports:
+      junit: tests-out/test-results/*.xml
+
+sbom:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+    - if: $CI_COMMIT_TAG
+  stage: build
+  cache: !reference [.gradle-cache, cache]
+  before_script:
+    - BUILD_HELPERS_VERSION=$[[ inputs.build_helpers_version ]]
+    - git init build-helpers -q -b unused
+    - git -C build-helpers fetch -q --depth 1 $CI_SERVER_PROTOCOL://gitlab-ci-token:${CI_JOB_TOKEN}@$CI_SERVER_HOST:$CI_SERVER_PORT/linbit/build-helpers.git $BUILD_HELPERS_VERSION
+    - git -C build-helpers checkout -q $BUILD_HELPERS_VERSION
+    - . build-helpers/gitlab-utils.sh
+    - ci_prepare_tools
+  script:
+    - git apply scripts/gradle-cyclonedx.diff
+    - ./gradlew cyclonedxBom
+# bom upload doesn't work currently
+#    - if [ -n "$CI_COMMIT_TAG" ] || [ "$CI_COMMIT_BRANCH" == "jenkins" ]; then
+#    -   ci_put_bom linstor-server ${CI_COMMIT_TAG:-$CI_COMMIT_BRANCH} build/reports/linstor-server.json
+#    - fi
+  artifacts:
+    paths:
+    - build/reports/linstor-server.json
+
+cve-scan:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == "jenkins"
+    - if: $CI_COMMIT_TAG
+  stage: test
+  image: "${LINBIT_DOCKER_REGISTRY}/trivy:latest"
+  variables:
+    # No need to clone the repo, we exclusively work on artifacts.  See
+    # https://docs.gitlab.com/ee/ci/runners/README.html#git-strategy
+    GIT_STRATEGY: none
+  script:
+    - trivy --version
+    - trivy -q sbom --exit-code 0 --format template --template "@/contrib/html.tpl" -o cve-scan.html build/reports/linstor-server.json
+    # Prints full report
+    - trivy -q sbom --exit-code 0 build/reports/linstor-server.json
+    # Fail on critical (unfixed) vulnerabilities
+    - trivy -q sbom --exit-code 1 --ignore-unfixed --severity CRITICAL build/reports/linstor-server.json
+  allow_failure: true # For now...
+  artifacts:
+    when: always
+    expose_as: "CVE Scan"
+    paths:
+      - cve-scan.html

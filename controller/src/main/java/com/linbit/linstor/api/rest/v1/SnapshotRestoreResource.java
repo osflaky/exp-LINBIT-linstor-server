@@ -1,0 +1,82 @@
+package com.linbit.linstor.api.rest.v1;
+
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.rest.v1.serializer.JsonGenTypes;
+import com.linbit.linstor.api.rest.v1.utils.ApiCallRcRestUtils;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlSnapshotRestoreApiCallHandler;
+import com.linbit.linstor.logging.ErrorReporter;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.Suspended;
+import jakarta.ws.rs.core.Context;
+
+import java.io.IOException;
+import java.util.Collections;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.glassfish.grizzly.http.server.Request;
+import org.slf4j.MDC;
+import reactor.core.publisher.Flux;
+
+@Path("v1/resource-definitions/{rscName}/snapshot-restore-resource")
+public class SnapshotRestoreResource
+{
+    private final ObjectMapper objectMapper;
+    private final RequestHelper requestHelper;
+    private final CtrlSnapshotRestoreApiCallHandler ctrlSnapshotRestoreApiCallHandler;
+
+    @Inject
+    SnapshotRestoreResource(
+        RequestHelper requestHelperRef,
+        CtrlSnapshotRestoreApiCallHandler ctrlSnapshotRestoreApiCallHandlerRef
+    )
+    {
+        requestHelper = requestHelperRef;
+        ctrlSnapshotRestoreApiCallHandler = ctrlSnapshotRestoreApiCallHandlerRef;
+
+        objectMapper = new ObjectMapper();
+    }
+
+    @POST
+    @Path("{snapName}")
+    public void restoreResource(
+        @Context Request request,
+        @Suspended final AsyncResponse asyncResponse,
+        @PathParam("rscName") String rscName,
+        @PathParam("snapName") String snapName,
+        String jsonData
+    )
+    {
+        try (var ignore = MDC.putCloseable(ErrorReporter.LOGID, ErrorReporter.getNewLogId()))
+        {
+            JsonGenTypes.SnapshotRestore snapRestore = objectMapper.readValue(
+                jsonData,
+                JsonGenTypes.SnapshotRestore.class
+            );
+
+            Flux<ApiCallRc> flux = ctrlSnapshotRestoreApiCallHandler.restoreSnapshot(
+                snapRestore.nodes,
+                rscName,
+                snapName,
+                snapRestore.to_resource,
+                snapRestore.stor_pool_rename == null ? Collections.emptyMap() : snapRestore.stor_pool_rename
+            );
+
+            requestHelper.doFlux(
+                ApiConsts.API_RESTORE_SNAPSHOT,
+                request,
+                asyncResponse,
+                ApiCallRcRestUtils.mapToMonoResponse(flux)
+            );
+        }
+        catch (IOException ioExc)
+        {
+            ApiCallRcRestUtils.handleJsonParseException(ioExc, asyncResponse);
+        }
+    }
+}

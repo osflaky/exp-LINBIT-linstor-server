@@ -1,0 +1,140 @@
+package com.linbit.linstor.api.interfaces.serializer;
+
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.pojo.FileInfoPojo;
+import com.linbit.linstor.api.pojo.FilePojo;
+import com.linbit.linstor.api.pojo.RequestFilePojo;
+import com.linbit.linstor.api.prop.WhitelistProps;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.StorPoolName;
+import com.linbit.linstor.event.EventIdentifier;
+import com.linbit.linstor.event.common.ResourceState;
+import com.linbit.linstor.logging.ErrorReportResult;
+import com.linbit.linstor.proto.requests.MsgReqDrbdReactorExecOuterClass.DrbdReactorCommand;
+import com.linbit.linstor.storage.kinds.ExtToolsInfo;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+
+public interface CommonSerializer
+{
+    CommonSerializerBuilder headerlessBuilder();
+
+    CommonSerializerBuilder onewayBuilder(String apiCall);
+
+    CommonSerializerBuilder apiCallBuilder(String apiCall, Long apiCallId);
+
+    CommonSerializerBuilder answerBuilder(String msgContent, Long apiCallId);
+
+    CommonSerializerBuilder completionBuilder(Long apiCallId);
+
+    interface CommonSerializerBuilder
+    {
+        byte[] build();
+
+        CommonSerializerBuilder authError(ApiCallRcImpl apiCallRcRef);
+
+        CommonSerializerBuilder authSuccess(
+            long expectedFullSyncId,
+            int[] stltVersion,
+            String nodeUname,
+            @Nullable ApiConsts.Platform platform,
+            @Nullable String osVariant,
+            Collection<ExtToolsInfo> layerInfoListRef,
+            ApiCallRc responses,
+            String configDir,
+            boolean debugConsoleEnabled,
+            boolean logPrintStackTrace,
+            String logDirectory,
+            String logLevel,
+            @Nullable String logLevelLinstor,
+            @Nullable String stltOverrideNodeName,
+            boolean remoteSpdk,
+            boolean ebs,
+            String netBindAddress,
+            Integer netPort,
+            String netType,
+            Set<String> extFileWhitelist,
+            WhitelistProps whitelistProps
+        );
+
+        CommonSerializerBuilder bytes(byte[] bytes);
+
+        CommonSerializerBuilder apiCallRcSeries(ApiCallRc apiCallRc);
+        CommonSerializerBuilder apiCallAnswerMsg(ApiCallRc apiCallRc);
+
+        CommonSerializerBuilder event(
+            Integer watchId,
+            EventIdentifier eventIdentifier,
+            String eventStreamAction
+        );
+
+        CommonSerializerBuilder volumeDiskState(String diskState);
+        CommonSerializerBuilder replicationState(String peerName, String replicationState);
+        CommonSerializerBuilder donePercentageEvent(String peerName, @Nullable Float donePercentage);
+
+        CommonSerializerBuilder resourceStateEvent(ResourceState resourceState);
+
+        CommonSerializerBuilder connectionState(String connectionState);
+
+        CommonSerializerBuilder requestErrorReports(
+            Set<String> nodes,
+            boolean withContent,
+            Instant since,
+            Instant to,
+            Set<String> ids,
+            Long limit,
+            Long offset
+        );
+
+        CommonSerializerBuilder deleteErrorReports(
+            @Nullable Instant since,
+            @Nullable Instant to,
+            @Nullable String exception,
+            @Nullable String version,
+            @Nullable List<String> ids
+        );
+
+        CommonSerializerBuilder requestSosReport(String sosReportNameRef, LocalDateTime since);
+
+        CommonSerializerBuilder requestSosReportFiles(
+            String sosReportNameRef,
+            ArrayList<RequestFilePojo> nextBatchToRequestRef
+        );
+
+        CommonSerializerBuilder errorReports(ErrorReportResult errorReportResult);
+
+        CommonSerializerBuilder sosReportFileInfoList(
+            String nodeNameRef,
+            String sosReportNameRef,
+            @Nullable List<FileInfoPojo> fileListRef,
+            @Nullable String errorMsgRef
+        );
+
+        CommonSerializerBuilder sosReportFiles(
+            String nodeNameRef,
+            String sosReportNameRef,
+            List<FilePojo> filesRef
+        );
+
+        CommonSerializerBuilder cleanupSosReport(String sosReportNameRef);
+
+        CommonSerializerBuilder drbdReactorExecRequest(DrbdReactorCommand command, String config, boolean wait);
+
+        CommonSerializerBuilder drbdReactorExecResponse(int exitCode, byte[] stdout, byte[] stderr);
+
+        CommonSerializerBuilder filter(
+            Set<NodeName> nodesFilter,
+            Set<StorPoolName> storPoolFilter,
+            Set<ResourceName> resourceFilter
+        );
+    }
+}

@@ -1,0 +1,547 @@
+package com.linbit.linstor.layer.resource;
+
+import com.linbit.ExhaustedPoolException;
+import com.linbit.InvalidNameException;
+import com.linbit.ValueInUseException;
+import com.linbit.ValueOutOfRangeException;
+import com.linbit.linstor.LinStorException;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlVlmApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.identifier.StorPoolName;
+import com.linbit.linstor.core.objects.AbsResource;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.ResourceGroup;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.objects.Volume;
+import com.linbit.linstor.core.objects.VolumeDefinition;
+import com.linbit.linstor.core.repository.SystemConfRepository;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.layer.AbsLayerHelperUtils;
+import com.linbit.linstor.layer.LayerPayload;
+import com.linbit.linstor.layer.resource.CtrlRscLayerDataFactory.ChildResourceData;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.numberpool.DynamicNumberPool;
+import com.linbit.linstor.numberpool.NumberPoolModule;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.storage.data.RscLayerSuffixes;
+import com.linbit.linstor.storage.data.adapter.cache.CacheRscData;
+import com.linbit.linstor.storage.data.adapter.cache.CacheVlmData;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.storage.interfaces.categories.resource.RscDfnLayerObject;
+import com.linbit.linstor.storage.interfaces.categories.resource.VlmDfnLayerObject;
+import com.linbit.linstor.storage.interfaces.categories.resource.VlmProviderObject;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.utils.LayerDataFactory;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+@Singleton
+class RscCacheLayerHelper extends AbsCachedRscLayerHelper<
+    CacheRscData<Resource>, CacheVlmData<Resource>,
+    RscDfnLayerObject, VlmDfnLayerObject>
+{
+    private final SystemConfRepository systemConfRepository;
+
+    @Inject
+    RscCacheLayerHelper(
+        ErrorReporter errorReporterRef,
+        LayerDataFactory layerDataFactoryRef,
+        @Named(NumberPoolModule.LAYER_RSC_ID_POOL) DynamicNumberPool layerRscIdPoolRef,
+        Provider<CtrlRscLayerDataFactory> rscLayerDataFactory,
+        SystemConfRepository systemConfRepositoryRef
+    )
+    {
+        super(
+            errorReporterRef,
+            layerDataFactoryRef,
+            layerRscIdPoolRef,
+            // CacheRscData.class cannot directly be casted to Class<CacheRscData<Resource>>. because java.
+            // its type is Class<CacheRscData> (without nested types), but that is not enough as the
+            // super constructor wants a Class<RSC_PO>, where RSC_PO is CacheRscData<Resource>.
+            (Class<CacheRscData<Resource>>) ((Object) CacheRscData.class),
+            DeviceLayerKind.CACHE,
+            rscLayerDataFactory
+        );
+        systemConfRepository = systemConfRepositoryRef;
+    }
+
+    @Override
+    protected @Nullable RscDfnLayerObject createRscDfnData(
+        ResourceDefinition rscDfnRef,
+        String rscNameSuffixRef,
+        LayerPayload payloadRef
+    )
+    {
+        // CacheLayer does not have resource-definition specific data
+        return null;
+    }
+
+    @Override
+    protected void mergeRscDfnData(RscDfnLayerObject rscDfnRef, LayerPayload payloadRef)
+    {
+        // no Cache specific resource-definition, nothing to merge
+    }
+
+    @Override
+    protected @Nullable VlmDfnLayerObject createVlmDfnData(
+        VolumeDefinition vlmDfnRef,
+        String rscNameSuffixRef,
+        LayerPayload payloadRef
+    )
+    {
+        // CacheLayer does not have volume-definition specific data
+        return null;
+    }
+
+    @Override
+    protected void mergeVlmDfnData(VlmDfnLayerObject vlmDfnDataRef, LayerPayload payloadRef)
+    {
+        // no Cache specific volume-definition, nothing to merge
+    }
+
+    @Override
+    protected CacheRscData<Resource> createRscData(
+        Resource rscRef,
+        LayerPayload payloadRef,
+        String rscNameSuffixRef,
+        AbsRscLayerObject<Resource> parentObjectRef,
+        List<DeviceLayerKind> layerListRef
+    )
+        throws DatabaseException, ValueOutOfRangeException, ExhaustedPoolException,
+            ValueInUseException
+    {
+        return layerDataFactory.createCacheRscData(
+            layerRscIdPool.autoAllocate(),
+            rscRef,
+            rscNameSuffixRef,
+            parentObjectRef
+        );
+    }
+
+    @Override
+    protected void mergeRscData(CacheRscData<Resource> rscDataRef, LayerPayload payloadRef)
+    {
+        // nothing to merge
+    }
+
+    @Override
+    protected boolean needsChildVlm(AbsRscLayerObject<Resource> childRscDataRef, Volume vlmRef)
+        throws InvalidKeyException
+    {
+        return true;
+    }
+
+
+    @Override
+    protected Set<StorPool> getNeededStoragePools(
+        Resource rscRef,
+        VolumeDefinition vlmDfn,
+        LayerPayload payloadRef,
+        List<DeviceLayerKind> layerListRef
+    )
+    {
+        Set<StorPool> storPools = new HashSet<>();
+        if (genericNeedsCacheDevice(rscRef, layerListRef))
+        {
+            storPools.add(getCacheStorPool(rscRef, vlmDfn));
+            StorPool metaSP = getMetaStorPool(rscRef, vlmDfn);
+
+            if (metaSP != null)
+            {
+                storPools.add(metaSP);
+            }
+        }
+
+        return storPools;
+    }
+
+    @Override
+    protected CacheVlmData<Resource> createVlmLayerData(
+        CacheRscData<Resource> cacheRscData,
+        Volume vlm,
+        LayerPayload payload,
+        List<DeviceLayerKind> layerListRef
+    )
+        throws DatabaseException, ValueOutOfRangeException, ExhaustedPoolException,
+            ValueInUseException, LinStorException
+    {
+        StorPool cacheStorPool = null;
+        StorPool metaStorPool = null;
+        if (genericNeedsCacheDevice(cacheRscData.getAbsResource(), layerListRef))
+        {
+            cacheStorPool = getCacheStorPool(vlm);
+            metaStorPool = getMetaStorPool(vlm);
+
+            if (metaStorPool == null)
+            {
+                metaStorPool = cacheStorPool; // fallback
+            }
+        }
+        return layerDataFactory.createCacheVlmData(
+            vlm,
+            cacheStorPool,
+            metaStorPool,
+            cacheRscData
+        );
+    }
+
+    @Override
+    protected void mergeVlmData(
+        CacheVlmData<Resource> vlmDataRef,
+        Volume vlmRef,
+        LayerPayload payloadRef,
+        List<DeviceLayerKind> layerListRef
+    )
+        throws InvalidKeyException
+    {
+        // nothing to do
+    }
+
+    @Override
+    protected List<ChildResourceData> getChildRsc(
+        CacheRscData<Resource> rscDataRef,
+        List<DeviceLayerKind> layerListRef
+    )
+        throws InvalidKeyException
+    {
+        // always return data and cache child
+        List<ChildResourceData> children = new ArrayList<>();
+        children.add(new ChildResourceData(RscLayerSuffixes.SUFFIX_DATA));
+
+        if (genericNeedsCacheDevice(rscDataRef.getAbsResource(), layerListRef))
+        {
+            children.add(
+                new ChildResourceData(
+                    RscLayerSuffixes.SUFFIX_CACHE_CACHE,
+                    null,
+                    DeviceLayerKind.STORAGE
+                )
+            );
+            children.add(
+                new ChildResourceData(
+                    RscLayerSuffixes.SUFFIX_CACHE_META,
+                    null,
+                    DeviceLayerKind.STORAGE
+                )
+            );
+        }
+
+        return children;
+    }
+
+    @Override
+    public StorPool getStorPool(Volume vlmRef, AbsRscLayerObject<Resource> childRef)
+        throws InvalidKeyException, InvalidNameException
+    {
+        StorPool pool;
+        CacheVlmData<Resource> cacheVlmData = (CacheVlmData<Resource>) childRef
+            .getParent()
+            .getVlmProviderObject(
+                vlmRef.getVolumeDefinition().getVolumeNumber()
+            );
+        if (childRef.getSuffixedResourceName().contains(RscLayerSuffixes.SUFFIX_CACHE_CACHE))
+        {
+            pool = cacheVlmData.getCacheStorPool();
+        }
+        else if (childRef.getSuffixedResourceName().contains(RscLayerSuffixes.SUFFIX_CACHE_META))
+        {
+            pool = cacheVlmData.getMetaStorPool();
+        }
+        else
+        {
+            pool = cacheVlmData.getStorPool();
+        }
+        return pool;
+    }
+
+    @Override
+    protected void resetStoragePools(AbsRscLayerObject<Resource> rscDataRef)
+        throws DatabaseException
+    {
+        // no-op
+    }
+
+    @Override
+    protected boolean recalculateVolatilePropertiesImpl(
+        CacheRscData<Resource> rscDataRef,
+        List<DeviceLayerKind> layerListRef,
+        LayerPayload payloadRef
+    )
+    {
+        return false; // no change
+    }
+
+
+    @Override
+    protected boolean isExpectedToProvideDevice(CacheRscData<Resource> cacheRscData)
+    {
+        return !cacheRscData.hasAnyPreventExecutionIgnoreReason();
+    }
+
+    private @Nullable StorPool getSpecialStorPool(
+        Volume vlm,
+        String propKey,
+        String usage,
+        boolean throwIfNull
+    ) throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            getPrioProps(vlm),
+            vlm.getAbsResource().getNode(),
+            propKey,
+            usage,
+            throwIfNull,
+            CtrlVlmApiCallHandler.getVlmDescriptionInline(vlm)
+        );
+    }
+
+    private @Nullable StorPool getSpecialStorPool(
+        Resource rsc,
+        VolumeDefinition vlmDfn,
+        String propKey,
+        String usage,
+        boolean throwIfNull
+    )
+        throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            getPrioProps(rsc, vlmDfn),
+            rsc.getNode(),
+            propKey,
+            usage,
+            throwIfNull,
+            CtrlVlmApiCallHandler.getVlmDescription(rsc, vlmDfn)
+        );
+    }
+
+    private @Nullable StorPool getSpecialStorPool(
+        PriorityProps prioProps,
+        Node node,
+        String propKey,
+        String usage,
+        boolean throwIfNull,
+        String vlmDescription
+    )
+    {
+        String poolName = prioProps.getProp(
+            propKey, ApiConsts.NAMESPC_CACHE
+        );
+
+        if (poolName == null && throwIfNull)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_NOT_FOUND_STOR_POOL,
+                    "You have to set the property " +
+                        ApiConsts.NAMESPC_CACHE + "/" +
+                        propKey +
+                        " for " + vlmDescription +
+                        " in order to use the cache layer."
+                )
+            );
+        }
+        StorPool specStorPool = null;
+        try
+        {
+            if (poolName != null)
+            {
+                specStorPool = node.getStorPool(
+                    new StorPoolName(poolName)
+                );
+
+                if (specStorPool == null)
+                {
+                    throw new ApiRcException(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.FAIL_NOT_FOUND_STOR_POOL,
+                            "The " + vlmDescription + " specified '" + poolName +
+                                "' as the storage pool for " + usage + ". Node " +
+                                node.getName() + " does not have a storage pool" +
+                                " with that name"
+                        )
+                    );
+                }
+            }
+        }
+        catch (InvalidNameException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_STOR_POOL_NAME,
+                    "The " + vlmDescription + " specified '" + poolName +
+                        "' as the storage pool for " + usage + ". That name is invalid."
+                ),
+                exc
+            );
+        }
+        return specStorPool;
+    }
+
+    private @Nullable StorPool getCacheStorPool(Volume vlm) throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            vlm,
+            ApiConsts.KEY_CACHE_CACHE_POOL_NAME,
+            "cached data",
+            true
+        );
+    }
+
+    private @Nullable StorPool getMetaStorPool(Volume vlm)
+        throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            vlm,
+            ApiConsts.KEY_CACHE_META_POOL_NAME,
+            "meta data",
+            false
+        );
+    }
+
+    private @Nullable StorPool getCacheStorPool(Resource rsc, VolumeDefinition vlmDfn)
+        throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            rsc,
+            vlmDfn,
+            ApiConsts.KEY_CACHE_CACHE_POOL_NAME,
+            "cached data",
+            true
+        );
+    }
+
+    private @Nullable StorPool getMetaStorPool(Resource rsc, VolumeDefinition vlmDfn)
+        throws InvalidKeyException
+    {
+        return getSpecialStorPool(
+            rsc,
+            vlmDfn,
+            ApiConsts.KEY_CACHE_META_POOL_NAME,
+            "meta data",
+            false
+        );
+    }
+
+    private PriorityProps getPrioProps(Volume vlmRef)
+    {
+        VolumeDefinition vlmDfn = vlmRef.getVolumeDefinition();
+        ResourceDefinition rscDfn = vlmRef.getResourceDefinition();
+        ResourceGroup rscGrp = rscDfn.getResourceGroup();
+        Resource rsc = vlmRef.getAbsResource();
+        PriorityProps prioProps = new PriorityProps(
+            vlmDfn.getProps(),
+            rscGrp.getVolumeGroupProps(vlmDfn.getVolumeNumber()),
+            rsc.getProps(),
+            rscDfn.getProps(),
+            rscGrp.getProps(),
+            rsc.getNode().getProps(),
+            systemConfRepository.getStltConfForView()
+        );
+        return prioProps;
+    }
+
+    private PriorityProps getPrioProps(Resource rsc, VolumeDefinition vlmDfn)
+    {
+        ResourceDefinition rscDfn = rsc.getResourceDefinition();
+        ResourceGroup rscGrp = rscDfn.getResourceGroup();
+        PriorityProps prioProps = new PriorityProps(
+            vlmDfn.getProps(),
+            rscGrp.getVolumeGroupProps(vlmDfn.getVolumeNumber()),
+            rsc.getProps(),
+            rscDfn.getProps(),
+            rscGrp.getProps(),
+            rsc.getNode().getProps(),
+            systemConfRepository.getStltConfForView()
+        );
+        return prioProps;
+    }
+
+    @Override
+    protected <RSC extends AbsResource<RSC>> @Nullable RscDfnLayerObject restoreRscDfnData(
+        ResourceDefinition rscDfnRef,
+        AbsRscLayerObject<RSC> fromSnapDataRef
+    )
+        throws DatabaseException, ValueOutOfRangeException, ExhaustedPoolException,
+        ValueInUseException
+    {
+        // CacheLayer does not have resource-definition specific data
+        return null;
+    }
+
+    @Override
+    protected <RSC extends AbsResource<RSC>> CacheRscData<Resource> restoreRscData(
+        Resource rscRef,
+        AbsRscLayerObject<RSC> fromAbsRscDataRef,
+        AbsRscLayerObject<Resource> rscParentRef
+    )
+        throws DatabaseException, ExhaustedPoolException
+    {
+        return layerDataFactory.createCacheRscData(
+            layerRscIdPool.autoAllocate(),
+            rscRef,
+            fromAbsRscDataRef.getResourceNameSuffix(),
+            rscParentRef
+        );
+    }
+
+    @Override
+    protected <RSC extends AbsResource<RSC>> @Nullable VlmDfnLayerObject restoreVlmDfnData(
+        VolumeDefinition vlmDfnRef,
+        VlmProviderObject<RSC> fromSnapVlmDataRef
+    ) throws DatabaseException, ValueOutOfRangeException, ExhaustedPoolException,
+        ValueInUseException
+    {
+        // CacheLayer does not have volume-definition specific data
+        return null;
+    }
+
+    @Override
+    protected <RSC extends AbsResource<RSC>> CacheVlmData<Resource> restoreVlmData(
+        Volume vlmRef,
+        CacheRscData<Resource> rscDataRef,
+        VlmProviderObject<RSC> vlmProviderObjectRef,
+        Map<String, String> storpoolRenameMap,
+        @Nullable ApiCallRc apiCallRc
+    )
+        throws DatabaseException, InvalidNameException
+    {
+        CacheVlmData<RSC> cacheVlmData = (CacheVlmData<RSC>) vlmProviderObjectRef;
+        StorPool cachePool = AbsLayerHelperUtils.getStorPool(
+            vlmRef,
+            rscDataRef,
+            cacheVlmData.getCacheStorPool(),
+            storpoolRenameMap,
+            apiCallRc
+        );
+        StorPool metaPool = AbsLayerHelperUtils.getStorPool(
+            vlmRef,
+            rscDataRef,
+            cacheVlmData.getMetaStorPool(),
+            storpoolRenameMap,
+            apiCallRc
+        );
+
+        return layerDataFactory.createCacheVlmData(
+            vlmRef,
+            cachePool,
+            metaPool,
+            rscDataRef
+        );
+    }
+}

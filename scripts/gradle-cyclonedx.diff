@@ -1,0 +1,19 @@
+diff --git a/build.gradle b/build.gradle
+index 9df6c840c..2f0654160 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -10,6 +10,14 @@ buildscript {
+ 
+ plugins {
+     id("net.ltgt.errorprone") version "5.1.1" apply false
++    id 'org.cyclonedx.bom' version '2.3.1'
++}
++
++cyclonedxBom {
++    projectType = "application"
++    outputName = "linstor-server"
++    outputFormat = "json"
++    skipConfigs = ["h2v1migration"]
+ }
+ 
+ apply plugin: 'java'

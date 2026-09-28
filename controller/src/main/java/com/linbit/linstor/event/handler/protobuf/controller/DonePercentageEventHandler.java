@@ -1,0 +1,98 @@
+package com.linbit.linstor.event.handler.protobuf.controller;
+
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.repository.NodeRepository;
+import com.linbit.linstor.event.EventIdentifier;
+import com.linbit.linstor.event.common.DonePercentageEvent;
+import com.linbit.linstor.event.handler.EventHandler;
+import com.linbit.linstor.event.handler.SatelliteStateHelper;
+import com.linbit.linstor.event.handler.protobuf.ProtobufEventHandler;
+import com.linbit.linstor.proto.eventdata.EventDonePercentageOuterClass;
+import com.linbit.linstor.satellitestate.SatelliteVolumeState;
+import com.linbit.utils.PairNonNull;
+
+import static com.linbit.linstor.event.handler.protobuf.controller.ReplicationStateEventHandler.getMappedName;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Optional;
+
+@ProtobufEventHandler(
+    eventName = InternalApiConsts.EVENT_DONE_PERCENTAGE
+)
+@Singleton
+public class DonePercentageEventHandler implements EventHandler
+{
+    private final SatelliteStateHelper satelliteStateHelper;
+    private final DonePercentageEvent donePercentageEvent;
+    private final NodeRepository nodeRepo;
+
+    @Inject
+    public DonePercentageEventHandler(
+        SatelliteStateHelper satelliteStateHelperRef,
+        DonePercentageEvent donePercentageEventRef,
+        NodeRepository nodeRepositoryRef
+    )
+    {
+        satelliteStateHelper = satelliteStateHelperRef;
+        donePercentageEvent = donePercentageEventRef;
+        nodeRepo = nodeRepositoryRef;
+    }
+
+    @Override
+    public void execute(String eventAction, EventIdentifier eventIdentifier, InputStream eventDataIn)
+        throws IOException
+    {
+
+        if (eventAction.equals(InternalApiConsts.EVENT_STREAM_VALUE))
+        {
+            EventDonePercentageOuterClass.EventDonePercentage eventDonePercentage =
+                EventDonePercentageOuterClass.EventDonePercentage.parseDelimitedFrom(eventDataIn);
+
+            @Nullable NodeName mappedName = getMappedName(nodeRepo, eventDonePercentage.getPeerName());
+            if (mappedName != null)
+            {
+                PairNonNull<String, Optional<Float>> donePercentage = eventDonePercentage.hasDonePercentage() ?
+                    new PairNonNull<>(mappedName.displayValue, Optional.of(eventDonePercentage.getDonePercentage())) :
+                    new PairNonNull<>(mappedName.displayValue, Optional.empty());
+                satelliteStateHelper.onSatelliteState(
+                    eventIdentifier.getNodeName(),
+                    satelliteState -> satelliteState.setOnVolume(
+                        eventIdentifier.getResourceName(),
+                        eventIdentifier.getVolumeNumber(),
+                        SatelliteVolumeState::setDonePercentage,
+                        donePercentage
+                    )
+                );
+                donePercentageEvent.get()
+                    .forwardEvent(
+                        eventIdentifier.getObjectIdentifier(),
+                        eventAction,
+                        donePercentage
+                    );
+            }
+        }
+        else
+        {
+            satelliteStateHelper.onSatelliteState(
+                eventIdentifier.getNodeName(),
+                satelliteState -> satelliteState.unsetOnVolume(
+                    eventIdentifier.getResourceName(),
+                    eventIdentifier.getVolumeNumber(),
+                    SatelliteVolumeState::setDonePercentage
+                )
+            );
+            donePercentageEvent.get()
+                .forwardEvent(
+                    eventIdentifier.getObjectIdentifier(),
+                    eventAction
+                );
+        }
+
+    }
+}

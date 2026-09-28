@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package com.linbit.linstor.proto.javainternal.c2s;
+
+message MsgIntArchiveLogs {
+    // archive error-report logs older than the given number of days
+    int64 age_days = 1;
+}

@@ -1,0 +1,57 @@
+package com.linbit.linstor.propscon;
+
+import com.linbit.ImplementationError;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.prop.LinStorObject;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.dbdrivers.interfaces.PropsDatabaseDriver;
+import com.linbit.linstor.transaction.manager.TransactionMgr;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+
+public class PropsContainerFactory
+{
+    private final PropsDatabaseDriver dbDriver;
+    private final Provider<TransactionMgr> transMgrProvider;
+
+    @Inject
+    public PropsContainerFactory(
+        PropsDatabaseDriver dbDriverRef,
+        Provider<TransactionMgr> transMgrProviderRef
+    )
+    {
+        dbDriver = dbDriverRef;
+        transMgrProvider = transMgrProviderRef;
+    }
+
+    public PropsContainer getInstance(String instanceName, @Nullable String description, LinStorObject type)
+        throws DatabaseException
+    {
+        PropsContainer container = create(instanceName, description, type);
+
+        container.loadAll();
+
+        return container;
+    }
+
+    public PropsContainer create(@Nullable String instanceName, String description, LinStorObject type)
+    {
+        PropsContainer container;
+        try
+        {
+            container = new PropsContainer(null, null, instanceName, description, type, dbDriver, transMgrProvider);
+        }
+        catch (InvalidKeyException keyExc)
+        {
+            // If root container creation generates an InvalidKeyException,
+            // that is always a bug in the implementation
+            throw new ImplementationError(
+                "Root container creation generated an exception",
+                keyExc
+            );
+        }
+
+        return container;
+    }
+}

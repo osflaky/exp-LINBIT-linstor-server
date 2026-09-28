@@ -1,0 +1,195 @@
+package com.linbit.linstor.core.apicallhandler.controller.autoplacer;
+
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.interfaces.AutoSelectFilterApi;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlMinIoSizeHelper;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscStateHelper;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.logging.ErrorReporter;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Set;
+import java.util.TreeSet;
+
+@Singleton
+public class Autoplacer
+{
+    public static final String MIN_FREE_SPACE_PROP = ApiConsts.NAMESPC_AUTOPLACER + "/" +
+        ApiConsts.KEY_AUTOPLACE_MIN_THIN_FREE_SPACE;
+
+    private final StorPoolFilter filter;
+    private final StrategyHandler strategyHandler;
+    private final Selector selector;
+    private final ErrorReporter errorReporter;
+    private final CtrlRscStateHelper rscStateHelper;
+    private final CtrlMinIoSizeHelper minIoSizeHelper;
+
+    @Inject
+    public Autoplacer(
+        StorPoolFilter filterRef,
+        StrategyHandler strategyHandlerRef,
+        Selector selectorRef,
+        ErrorReporter errorReporterRef,
+        CtrlRscStateHelper rscStateHelperRef,
+        CtrlMinIoSizeHelper minIoSizeHelperRef
+    )
+    {
+        filter = filterRef;
+        strategyHandler = strategyHandlerRef;
+        selector = selectorRef;
+        errorReporter = errorReporterRef;
+        rscStateHelper = rscStateHelperRef;
+        minIoSizeHelper = minIoSizeHelperRef;
+    }
+
+    /**
+     * Selects storage pools for automatic resource placement.
+     *
+     * @return Null if no selection could be made of a non-empty Set of selected StorPools
+     */
+    public @Nullable Set<StorPool> autoPlace(
+        AutoSelectFilterApi selectFilter,
+        @Nullable ResourceDefinition rscDfnRef,
+        long rscSize
+    )
+    {
+        @Nullable Set<StorPool> selection = null;
+        @Nullable Resource.Flags disklessType = Resource.Flags.valueOfOrNull(selectFilter.getDisklessType());
+
+        long start = System.currentTimeMillis();
+        ArrayList<StorPool> availableStorPools = filter.listAvailableStorPools(disklessType == null);
+
+        // Can change minIoSize if a new resource definition is being created
+        final boolean canChangeMinIoSize = rscStateHelper.canChangeMinIoSize(rscDfnRef);
+        @Nullable final Long minIoSize = rscDfnRef == null ?
+            null :
+            rscDfnRef.getFloorVolumesMinIoSize(minIoSizeHelper.isAutoMinIoSize(rscDfnRef));
+
+        // 1: filter storage pools
+        long startFilter = System.currentTimeMillis();
+        ArrayList<StorPool> filteredStorPools = filter.filter(
+            selectFilter,
+            availableStorPools,
+            rscDfnRef,
+            rscSize,
+            disklessType,
+            canChangeMinIoSize,
+            minIoSize
+        );
+        errorReporter.logTrace(
+            "Autoplacer.Filter: Finished in %dms. %s StorPools remaining",
+            System.currentTimeMillis() - startFilter,
+            filteredStorPools.size()
+        );
+
+        // 2: rate each storage pool with different weighted strategies
+        long startRating = System.currentTimeMillis();
+        Collection<StorPoolWithScore> storPoolsWithScoreList = strategyHandler.rate(filteredStorPools);
+        errorReporter.logTrace(
+            "Autoplacer.Strategy: Finished in %dms.",
+            System.currentTimeMillis() - startRating
+        );
+
+        // 3: actual selection of storage pools
+        long startSelection = System.currentTimeMillis();
+        @Nullable Set<StorPoolWithScore> selectionWithScores = selector.select(
+            selectFilter,
+            rscDfnRef,
+            storPoolsWithScoreList,
+            canChangeMinIoSize,
+            minIoSize
+        );
+        errorReporter.logTrace(
+            "Autoplacer.Selection: Finished in %dms.",
+            System.currentTimeMillis() - startSelection
+        );
+
+        boolean foundCandidate = selectionWithScores != null;
+        if (foundCandidate)
+        {
+            selection = new TreeSet<>();
+            for (StorPoolWithScore spWithScore : selectionWithScores)
+            {
+                selection.add(spWithScore.storPool);
+            }
+        }
+        errorReporter.logTrace(
+            "Autoplacer: Finished in %dms %s candidate",
+            System.currentTimeMillis() - start,
+            foundCandidate ? "with" : "without"
+        );
+        return selection;
+    }
+
+    public static class StorPoolWithScore implements Comparable<StorPoolWithScore>
+    {
+        StorPool storPool;
+        double score;
+
+        StorPoolWithScore(StorPool storPoolRef, double scoreRef)
+        {
+            storPool = storPoolRef;
+            score = scoreRef;
+        }
+
+        @Override
+        public int compareTo(StorPoolWithScore sp2)
+        {
+            // highest to lowest
+            int cmp = Double.compare(sp2.score, score);
+            if (cmp == 0)
+            {
+                cmp = storPool.compareTo(sp2.storPool); // by name (nodename first)
+            }
+            return cmp;
+        }
+
+        @Override
+        public int hashCode()
+        {
+            final int prime = 31;
+            int result = 1;
+            long temp;
+            temp = Double.doubleToLongBits(score);
+            result = prime * result + (int) (temp ^ (temp >>> 32));
+            result = prime * result + storPool.hashCode();
+            return result;
+        }
+
+        @Override
+        public boolean equals(Object obj)
+        {
+            if (this == obj)
+            {
+                return true;
+            }
+            if (!(obj instanceof StorPoolWithScore other))
+            {
+                return false;
+            }
+            if (Double.doubleToLongBits(score) != Double.doubleToLongBits(other.score))
+            {
+                return false;
+            }
+            if (!storPool.equals(other.storPool))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        @Override
+        public String toString()
+        {
+            return "StorPoolWithScore [storPool=" + storPool + ", score=" + score + "]";
+        }
+    }
+}
+

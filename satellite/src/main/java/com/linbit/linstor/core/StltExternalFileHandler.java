@@ -1,0 +1,404 @@
+package com.linbit.linstor.core;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.core.CoreModule.ExternalFileMap;
+import com.linbit.linstor.core.CoreModule.ResourceDefinitionMap;
+import com.linbit.linstor.core.cfg.StltConfig;
+import com.linbit.linstor.core.identifier.ExternalFileName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.objects.ExternalFile;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.api.pojo.ExtFileStatusPojo;
+import com.linbit.linstor.storage.StorageException;
+import com.linbit.linstor.utils.ByteUtils;
+import com.linbit.utils.StringUtils;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+@Singleton
+public class StltExternalFileHandler
+{
+    private final ErrorReporter errorReporter;
+
+    private final Map<ExternalFileName, Set<ResourceName>> extFileRequestedByRscDfnsMap;
+    private final Map<ResourceName, Set<ExternalFileName>> rscDfnToExtFilesMap;
+    private final ExternalFileMap extFileMap;
+    private final ResourceDefinitionMap rscDfnMap;
+    private final StltConfig stltCfg;
+
+    @Inject
+    public StltExternalFileHandler(
+        ErrorReporter errorReporterRef,
+        CoreModule.ExternalFileMap extFileMapRef,
+        CoreModule.ResourceDefinitionMap rscDfnMapRef,
+        StltConfig stltCfgRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        extFileMap = extFileMapRef;
+        rscDfnMap = rscDfnMapRef;
+        stltCfg = stltCfgRef;
+        extFileRequestedByRscDfnsMap = new HashMap<>();
+        rscDfnToExtFilesMap = new HashMap<>();
+    }
+
+    /**
+     * Cleanup caching maps
+     */
+    public void clear()
+    {
+        extFileRequestedByRscDfnsMap.clear();
+        rscDfnToExtFilesMap.clear();
+    }
+
+    public void ensureNotInUse(ExternalFile extFileRef)
+    {
+        Set<ResourceName> set = extFileRequestedByRscDfnsMap.get(extFileRef.getName());
+        if (set != null && !set.isEmpty())
+        {
+            throw new ImplementationError(
+                "External file " + extFileRef.getName().extFileName + " should be deleted but is still in use by:\n" +
+                    StringUtils.join(set, ", ")
+            );
+        }
+    }
+
+    public void rebuildExtFilesToRscDfnMaps(Node localNodeRef) throws StorageException
+    {
+        try
+        {
+            for (ResourceDefinition rscDfn : rscDfnMap.values())
+            {
+                Resource localRsc = rscDfn.getResource(localNodeRef.getName());
+                if (localRsc != null)
+                {
+                    /*
+                     * we might have an RD with an SPD with a local snapshot but NO resource
+                     */
+                    getRequestedExternalFiles(localRsc, false);
+                }
+            }
+        }
+        catch (InvalidNameException | DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    public void handle(Resource rscRef) throws StorageException
+    {
+        Set<ExternalFileName> requestedExternalFiles;
+        try
+        {
+            requestedExternalFiles = getRequestedExternalFiles(rscRef, true);
+            rewriteIfNeeded(requestedExternalFiles);
+        }
+        catch (InvalidNameException | DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private Set<ExternalFileName> getRequestedExternalFiles(Resource rscRef, boolean deleteExtFileIfNotNeeded)
+        throws InvalidNameException, StorageException, DatabaseException
+    {
+        Set<ExternalFileName> ret = new HashSet<>();
+
+        ResourceDefinition rscDfn = rscRef.getResourceDefinition();
+        ResourceName rscName = rscDfn.getName();
+        Set<ExternalFileName> alreadyRequestedExtFileSet = rscDfnToExtFilesMap.get(rscName);
+        Set<ExternalFileName> unrequestExtFileSet;
+        if (alreadyRequestedExtFileSet != null)
+        {
+            unrequestExtFileSet = new HashSet<>(alreadyRequestedExtFileSet);
+        }
+        else
+        {
+            unrequestExtFileSet = new HashSet<>();
+        }
+
+        if (!rscRef.getStateFlags().isSet(Resource.Flags.DELETE))
+        {
+            /*
+             * only check currently requested extFiles if the resource should not be deleted.
+             *
+             * otherwise the resource with the resource-definition itself will be deleted
+             * soon.
+             * As the layers should have already remove the resource, all thats left during this
+             * call is the resource in DELETE state. That means we can do the cleanup of extFiles already now
+             */
+
+            PriorityProps prioProps = new PriorityProps(
+                rscDfn.getProps() // for now prop is only allowed in RD.
+            );
+
+            Map<String, String> files = prioProps.renderRelativeMap(InternalApiConsts.NAMESPC_FILES);
+            for (Entry<String, String> file : files.entrySet())
+            {
+                if (file.getValue().equals(ApiConsts.VAL_TRUE))
+                {
+                    ExternalFileName extFileName = new ExternalFileName("/" + file.getKey());
+                    ret.add(extFileName);
+
+                    lazyAdd(rscDfnToExtFilesMap, rscName, extFileName);
+                    lazyAdd(extFileRequestedByRscDfnsMap, extFileName, rscName);
+                }
+            }
+        }
+
+        // cleanup rscDfnToExtFilesMap and extFileRequestedByRscDfnsMap
+        unrequestExtFileSet.removeAll(ret);
+        for (ExternalFileName extFileName : unrequestExtFileSet)
+        {
+            Set<ResourceName> requestedByRscDfnSet = extFileRequestedByRscDfnsMap.get(extFileName);
+            if (requestedByRscDfnSet != null)
+            {
+                requestedByRscDfnSet.remove(rscName);
+
+                if (deleteExtFileIfNotNeeded)
+                {
+                    if (requestedByRscDfnSet.isEmpty())
+                    {
+                        delete(extFileName);
+                    }
+                    else
+                    {
+                        errorReporter.logTrace(
+                            "Not deleting %s as it is still used by some resource definitions",
+                            extFileName.extFileName
+                        );
+                    }
+                }
+            }
+        }
+
+        rscDfnToExtFilesMap.put(rscName, ret);
+
+        return ret;
+    }
+
+    private <K, V> void lazyAdd(Map<K, Set<V>> map, K key, V value)
+    {
+        Set<V> set = map.get(key);
+        if (set == null)
+        {
+            set = new HashSet<>();
+            map.put(key, set);
+        }
+        set.add(value);
+    }
+
+    private void rewriteIfNeeded(Set<ExternalFileName> requestedExternalFilesRef)
+        throws InvalidNameException, StorageException, DatabaseException
+    {
+        for (ExternalFileName extFileName : requestedExternalFilesRef)
+        {
+            ExternalFile externalFile = extFileMap.get(extFileName);
+            if (externalFile == null)
+            {
+                throw new ImplementationError("Unknown external file requested");
+            }
+            if (
+                !externalFile.alreadyWritten() &&
+                externalFile.getContent().length > 0 &&
+                isWhitelisted(externalFile)
+            )
+            {
+                rewrite(externalFile);
+            }
+        }
+    }
+
+    private boolean isWhitelisted(ExternalFile externalFileRef) throws StorageException
+    {
+        Path extFilePath = Paths.get(externalFileRef.getName().extFileName).normalize();
+        boolean whitelisted = stltCfg.getWhitelistedExternalFilePaths().contains(extFilePath.getParent());
+        if (!whitelisted)
+        {
+            // keep the message text as is: at least LINSTOR Gateway still matches on
+            // "does not have a whitelisted parent" as long as older satellites are around
+            throw new StorageException(
+                "The path " + extFilePath + " does not have a whitelisted parent. Allowed parent directories: " +
+                    stltCfg.getWhitelistedExternalFilePaths(),
+                null,
+                "The parent directory of the external file is not listed in the satellite's 'allowExtFiles' " +
+                    "configuration",
+                "Add the directory to the 'allowExtFiles' list in the [files] section of the satellite " +
+                    "configuration (usually /etc/linstor/linstor_satellite.toml) and restart the satellite",
+                null,
+                ApiConsts.FAIL_ACC_DENIED_EXT_FILE,
+                null
+            );
+        }
+        return true;
+    }
+
+    /**
+     * Resolves the actual file path to use for an external file. Checks whether an alternative
+     * suffixed path already exists on disk (e.g. foo.toml.disabled) and returns that path instead
+     * of the canonical path.
+     *
+     * @return the path where the file actually exists, or the canonical path if no alternative exists
+     */
+    private Path resolveActualPath(ExternalFile externalFile) throws StorageException
+    {
+        String canonical = externalFile.getName().extFileName;
+
+        List<Path> existingPaths = new ArrayList<>();
+        Path canonicalPath = Paths.get(canonical);
+        if (Files.exists(canonicalPath))
+        {
+            existingPaths.add(canonicalPath);
+        }
+        List<String> suffixes = externalFile.getAltSuffixes();
+        for (String suffix : suffixes)
+        {
+            Path altPath = Paths.get(canonical + suffix);
+            if (Files.exists(altPath))
+            {
+                existingPaths.add(altPath);
+            }
+        }
+        return switch (existingPaths.size())
+        {
+            case 0 -> canonicalPath;
+            case 1 -> existingPaths.get(0);
+            default -> throw new StorageException("Multiple alternatives of the file exist: " + existingPaths);
+        };
+    }
+
+    private void rewrite(ExternalFile externalFile) throws StorageException, DatabaseException
+    {
+        Path path = resolveActualPath(externalFile);
+        Path tmpFile;
+        try
+        {
+            tmpFile = Files.createTempFile(path.getParent(), null, ".tmp");
+        }
+        catch (IOException exc)
+        {
+            throw new StorageException(
+                "Failed to create temporary file in directory: " + path.getParent(),
+                exc
+            );
+        }
+        try
+        {
+            errorReporter.logDebug("Writing into temporary external file: %s", tmpFile.toString());
+            Files.write(tmpFile, externalFile.getContent(), StandardOpenOption.WRITE);
+        }
+        catch (IOException exc)
+        {
+            throw new StorageException("Failed to write content in temporary file: " + tmpFile, exc);
+        }
+
+        try
+        {
+            errorReporter.logDebug(
+                "Moving temporary file (%s) to its destination: %s",
+                tmpFile.toString(),
+                path.toString()
+            );
+            Files.move(tmpFile, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        }
+        catch (IOException exc)
+        {
+            throw new StorageException(
+                "Failed to atomically move temporary file (" + tmpFile + ") to its destination (" + path + ")",
+                exc
+            );
+        }
+        errorReporter.logInfo("External file %s written successfully", path.toString());
+        externalFile.setAlreadyWritten(true);
+    }
+
+    public ExtFileStatusPojo getStatus(ExternalFileName extFileNameRef) throws StorageException
+    {
+        ExternalFile externalFile = extFileMap.get(extFileNameRef);
+        if (externalFile == null)
+        {
+            throw new StorageException("Unknown external file: " + extFileNameRef.extFileName);
+        }
+
+        Path actualPath = resolveActualPath(externalFile);
+        boolean contentMatch = false;
+        String actualPathStr = "";
+
+        if (Files.exists(actualPath))
+        {
+            actualPathStr = actualPath.toString();
+            try
+            {
+                byte[] diskContent = Files.readAllBytes(actualPath);
+                byte[] diskChecksum = ByteUtils.checksumSha256(diskContent);
+                byte[] expectedChecksum = externalFile.getContentCheckSum();
+                contentMatch = Arrays.equals(diskChecksum, expectedChecksum);
+            }
+            catch (IOException exc)
+            {
+                throw new StorageException("Failed to read external file: " + actualPath, exc);
+            }
+        }
+
+        return new ExtFileStatusPojo(actualPathStr, contentMatch);
+    }
+
+    private void delete(ExternalFileName extFileNameRef) throws StorageException, DatabaseException
+    {
+        try
+        {
+            ExternalFile extFile = extFileMap.get(extFileNameRef);
+            String canonical = extFileNameRef.extFileName;
+
+            errorReporter.logTrace("Deleting external file: %s", canonical);
+            Files.deleteIfExists(Paths.get(canonical));
+
+            // also delete all alternative-suffix variants
+            for (String suffix : extFile.getAltSuffixes())
+            {
+                Path altPath = Paths.get(canonical + suffix);
+                if (Files.deleteIfExists(altPath))
+                {
+                    errorReporter.logTrace("Deleted alternative external file: %s", altPath);
+                }
+            }
+
+            if (!extFile.isDeleted())
+            {
+                extFile.setAlreadyWritten(false);
+            }
+            errorReporter.logInfo("External file %s deleted.", extFileNameRef);
+        }
+        catch (IOException exc)
+        {
+            throw new StorageException(
+                "Failed to remove external file " + extFileNameRef.extFileName,
+                exc
+            );
+        }
+    }
+}

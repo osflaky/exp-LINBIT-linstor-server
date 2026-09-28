@@ -1,0 +1,1609 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.ImplementationError;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.LinStorDataAlreadyExistsException;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiCallRcWith;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.ApiConsts.ConnectionStatus;
+import com.linbit.linstor.api.prop.LinStorObject;
+import com.linbit.linstor.compat.CompatibilityUtils;
+import com.linbit.linstor.core.BackupInfoManager;
+import com.linbit.linstor.core.LinStor;
+import com.linbit.linstor.core.SharedResourceManager;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.CtrlRscToggleDiskApiCallHandler.ToggleOp;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.AllocationGranularityHelper;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.ResourceCreateCheck;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.controller.utils.ResourceDataUtils;
+import com.linbit.linstor.core.apicallhandler.response.ApiDatabaseException;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.apicallhandler.response.ResponseUtils;
+import com.linbit.linstor.core.apis.VolumeApi;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.VolumeNumber;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.Resource.Flags;
+import com.linbit.linstor.core.objects.ResourceControllerFactory;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.SnapshotDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.objects.Volume;
+import com.linbit.linstor.core.objects.VolumeDefinition;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.event.EventStreamClosedException;
+import com.linbit.linstor.event.EventWaiter;
+import com.linbit.linstor.event.ObjectIdentifier;
+import com.linbit.linstor.event.common.ResourceStateEvent;
+import com.linbit.linstor.layer.LayerPayload;
+import com.linbit.linstor.layer.LayerPayload.DrbdRscPayload;
+import com.linbit.linstor.layer.resource.CtrlRscLayerDataFactory;
+import com.linbit.linstor.layer.storage.BlockSizeConsts;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.PeerNotConnectedException;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.propscon.InvalidValueException;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.stateflags.FlagsHelper;
+import com.linbit.linstor.stateflags.StateFlags;
+import com.linbit.linstor.storage.StorageConstants;
+import com.linbit.linstor.storage.data.RscLayerSuffixes;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscData;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.storage.interfaces.categories.resource.VlmProviderObject;
+import com.linbit.linstor.storage.interfaces.layers.drbd.DrbdRscObject;
+import com.linbit.linstor.storage.interfaces.layers.drbd.DrbdRscObject.DrbdRscFlags;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.kinds.DeviceProviderKind;
+import com.linbit.linstor.storage.utils.LayerUtils;
+import com.linbit.linstor.tasks.ScheduleBackupService;
+import com.linbit.linstor.utils.layer.DrbdLayerUtils;
+import com.linbit.linstor.utils.layer.LayerKindUtils;
+import com.linbit.linstor.utils.layer.LayerRscUtils;
+import com.linbit.linstor.utils.layer.LayerVlmUtils;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+import com.linbit.utils.MathUtils;
+import com.linbit.utils.PairNonNull;
+import com.linbit.utils.StringUtils;
+
+import static com.linbit.linstor.api.ApiConsts.MASK_STOR_POOL;
+import static com.linbit.linstor.api.ApiConsts.MASK_WARN;
+import static com.linbit.linstor.core.apicallhandler.controller.CtrlRscApiCallHandler.getRscDescriptionInline;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
+
+import org.reactivestreams.Publisher;
+import org.slf4j.MDC;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Singleton
+public class CtrlRscCrtApiHelper
+{
+    private static final long DFLT_RSC_READY_WAIT_TIME_IN_MS = 15_000;
+
+    private final ErrorReporter errorReporter;
+    private final CtrlPropsHelper ctrlPropsHelper;
+    private final CtrlVlmCrtApiHelper ctrlVlmCrtApiHelper;
+    private final EventWaiter eventWaiter;
+    private final ResourceStateEvent resourceStateEvent;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final ResponseConverter responseConverter;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final ResourceControllerFactory resourceFactory;
+    private final ResourceCreateCheck resourceCreateCheck;
+    private final CtrlRscLayerDataFactory layerDataHelper;
+    private final Provider<CtrlRscToggleDiskApiCallHandler> toggleDiskHelper;
+    private final SharedResourceManager sharedRscMgr;
+    private final CtrlSnapshotCrtHelper ctrlSnapCrtHelper;
+    private final BackupInfoManager backupInfoMgr;
+    private final ScheduleBackupService scheduleBackupService;
+    private final CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandler;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final ScopeRunner scopeRunner;
+    private final LockGuardFactory lockGuardFactory;
+    private final Provider<CtrlRscDfnApiCallHandler> ctrlRscDfnApiCallHandler;
+    private final AllocationGranularityHelper allocationGranularityHelper;
+    private final CtrlRscStateHelper rscStateHelper;
+    private final CtrlMinIoSizeHelper minIoSizeHelper;
+
+    @Inject
+    CtrlRscCrtApiHelper(
+        ErrorReporter errorReporterRef,
+        CtrlPropsHelper ctrlPropsHelperRef,
+        CtrlVlmCrtApiHelper ctrlVlmCrtApiHelperRef,
+        EventWaiter eventWaiterRef,
+        ResourceStateEvent resourceStateEventRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        ResponseConverter responseConverterRef,
+        CtrlApiDataLoader ctrlApiDataLoaderRef,
+        ResourceControllerFactory resourceFactoryRef,
+        ResourceCreateCheck resourceCreateCheckRef,
+        CtrlRscLayerDataFactory layerDataHelperRef,
+        Provider<CtrlRscToggleDiskApiCallHandler> toggleDiskHelperRef,
+        SharedResourceManager sharedRscMgrRef,
+        CtrlSnapshotCrtHelper ctrlSnapCrtHelperRef,
+        BackupInfoManager backupInfoMgrRef,
+        ScheduleBackupService scheduleBackupServiceRef,
+        CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandlerRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        ScopeRunner scopeRunnerRef,
+        LockGuardFactory lockGuardFactoryRef,
+        Provider<CtrlRscDfnApiCallHandler> ctrlRscDfnApiCallHandlerRef,
+        AllocationGranularityHelper allocationGranularityHelperRef,
+        CtrlRscStateHelper rscStateHelperRef,
+        CtrlMinIoSizeHelper minIoSizeHelperRef
+    )
+    {
+        errorReporter = errorReporterRef;
+        ctrlPropsHelper = ctrlPropsHelperRef;
+        ctrlVlmCrtApiHelper = ctrlVlmCrtApiHelperRef;
+        eventWaiter = eventWaiterRef;
+        resourceStateEvent = resourceStateEventRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        responseConverter = responseConverterRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        resourceFactory = resourceFactoryRef;
+        resourceCreateCheck = resourceCreateCheckRef;
+        layerDataHelper = layerDataHelperRef;
+        toggleDiskHelper = toggleDiskHelperRef;
+        sharedRscMgr = sharedRscMgrRef;
+        ctrlSnapCrtHelper = ctrlSnapCrtHelperRef;
+        backupInfoMgr = backupInfoMgrRef;
+        scheduleBackupService = scheduleBackupServiceRef;
+        ctrlRscActivateApiCallHandler = ctrlRscActivateApiCallHandlerRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        scopeRunner = scopeRunnerRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        ctrlRscDfnApiCallHandler = ctrlRscDfnApiCallHandlerRef;
+        allocationGranularityHelper = allocationGranularityHelperRef;
+        rscStateHelper = rscStateHelperRef;
+        minIoSizeHelper = minIoSizeHelperRef;
+    }
+
+    /**
+     * Convenience overload of
+     * {@link #createResourceDb(String, String, long, Map, List, Integer, List, Integer, Map, List,
+     * Resource.DiskfulBy, Boolean, boolean)} with allowDualActiveSharedRef set to false.
+     */
+    public PairNonNull<List<Flux<ApiCallRc>>, ApiCallRcWith<Resource>> createResourceDb(
+        String nodeNameStr,
+        String rscNameStr,
+        long flags,
+        Map<String, String> rscPropsMap,
+        List<? extends VolumeApi> vlmApiList,
+        @Nullable Integer nodeIdInt,
+        @Nullable List<Integer> portsRef,
+        @Nullable Integer portCountRef,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities,
+        List<String> layerStackStrListRef,
+        @Nullable Resource.DiskfulBy diskfulByRef,
+        @Nullable Boolean drbdClientRef
+    )
+    {
+        return createResourceDb(
+            nodeNameStr,
+            rscNameStr,
+            flags,
+            rscPropsMap,
+            vlmApiList,
+            nodeIdInt,
+            portsRef,
+            portCountRef,
+            thinFreeCapacities,
+            layerStackStrListRef,
+            diskfulByRef,
+            drbdClientRef,
+            false
+        );
+    }
+
+    /**
+     * This method really creates the resource and its volumes.
+     *
+     * This method does NOT:
+     * * commit any transaction
+     * * update satellites
+     * * create success-apiCallRc entries (only error RC in case of exception)
+     *
+     * @param allowDualActiveSharedRef if true, the new resource is not auto-deactivated although another
+     *     resource of the same shared storage pool is still active. Used by make-available with
+     *     auto_manage_dual_primary to get a dual-active shared resource for a live migration.
+     *
+     * @return the newly created resource
+     */
+    public PairNonNull<List<Flux<ApiCallRc>>, ApiCallRcWith<Resource>> createResourceDb(
+        String nodeNameStr,
+        String rscNameStr,
+        long flags,
+        Map<String, String> rscPropsMap,
+        List<? extends VolumeApi> vlmApiList,
+        @Nullable Integer nodeIdInt,
+        @Nullable List<Integer> portsRef,
+        @Nullable Integer portCountRef,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities,
+        List<String> layerStackStrListRef,
+        @Nullable Resource.DiskfulBy diskfulByRef,
+        @Nullable Boolean drbdClientRef,
+        boolean allowDualActiveSharedRef
+    )
+    {
+        ResourceDefinition rscDfn = ctrlApiDataLoader.loadRscDfn(rscNameStr);
+
+        boolean canChangeMinIo = false;
+        if (rscDfn != null)
+        {
+            if (rscDfn.getResourceCount() >= 1)
+            {
+                canChangeMinIo = rscStateHelper.canChangeMinIoSize(rscDfn);
+            }
+            else
+            {
+                // No currently deployed resources
+                canChangeMinIo = minIoSizeHelper.isAutoMinIoSize(rscDfn);
+            }
+        }
+        else
+        {
+            throw new ImplementationError(
+                "createResourceDb with rscDfn == null in " +
+                CtrlRscCrtApiHelper.class.getSimpleName()
+            );
+        }
+
+        long adjustedFlags = flags;
+        List<Flux<ApiCallRc>> autoFlux = new ArrayList<>();
+        Resource rsc;
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+
+        Node node = ctrlApiDataLoader.loadNode(nodeNameStr);
+        if (backupInfoMgr.restoreContainsRscDfn(rscDfn))
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_IN_USE,
+                    rscNameStr + " is currently being restored from a backup. " +
+                        "Please wait until the restore is finished"
+                )
+            );
+        }
+        if (isNodeFlagSet(node, Node.Flags.EVACUATE))
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_EVACUATING,
+                    "node '" + nodeNameStr + " is being evacuated. No new resources allowed on this node."
+                )
+            );
+        }
+
+        @Nullable Resource rscForToggleDiskful = ctrlApiDataLoader.loadRscOrNull(node.getName(), rscDfn.getName());
+        if (rscForToggleDiskful != null && !isFlagSet(rscForToggleDiskful, Resource.Flags.DRBD_DISKLESS))
+        {
+            // diskful resource, do not try to toggle this
+            rscForToggleDiskful = null;
+        }
+
+        String storPoolName = rscPropsMap.get(ApiConsts.KEY_STOR_POOL_NAME);
+        if (rscForToggleDiskful != null)
+        {
+            // rsc is diskless
+            rsc = rscForToggleDiskful;
+
+            String storPoolNameStr = storPoolName;
+            @Nullable StorPool storPool = storPoolNameStr == null ?
+                null : ctrlApiDataLoader.loadStorPoolOrNull(storPoolNameStr, nodeNameStr);
+
+            boolean isDiskless = FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.DISKLESS) || // needed for
+                                                                                              // compatibility
+                FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.DRBD_DISKLESS) ||
+                FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.NVME_INITIATOR) ||
+                FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.EBS_INITIATOR) ||
+                (storPool != null && storPool.getDeviceProviderKind().equals(DeviceProviderKind.DISKLESS)) ||
+                (drbdClientRef != null && drbdClientRef);
+
+            if (FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.INACTIVE))
+            {
+                autoFlux.add(ctrlRscActivateApiCallHandler.deactivateRsc(nodeNameStr, rscNameStr));
+            }
+
+            if (!isDiskless)
+            {
+                // just in case this was a tiebreaker
+                disableTiebreakerFlag(rscForToggleDiskful);
+
+                // target resource is diskful
+                autoFlux.add(
+                    toggleDiskHelper.get().resourceToggleDisk(
+                        nodeNameStr,
+                        rscNameStr,
+                        storPoolNameStr,
+                        null,
+                        layerStackStrListRef,
+                        ToggleOp.INTO_DRBD_DISKFUL,
+                        diskfulByRef
+                    )
+                );
+            }
+            else
+            {
+                boolean changed = disableTiebreakerFlag(rscForToggleDiskful);
+                if (drbdClientRef != null)
+                {
+                    // default: unchanged
+                    changed |= setClientFlag(rscForToggleDiskful, drbdClientRef);
+                }
+                if (changed)
+                {
+                    // target resource is diskless.
+                    NodeName tiebreakerNodeName = rscForToggleDiskful.getNode().getName();
+                    autoFlux.add(
+                        ctrlSatelliteUpdateCaller.updateSatellites(
+                            rscForToggleDiskful.getResourceDefinition(),
+                            Flux.empty() // if failed, there is no need for the retry-task to wait for readyState
+                            // this is only true as long as there is no other flux concatenated after readyResponses
+                        )
+                            .transform(
+                                updateResponses -> CtrlResponseUtils.combineResponses(
+                                    errorReporter,
+                                    updateResponses,
+                                    rscDfn.getName(),
+                                    Collections.singleton(tiebreakerNodeName),
+                                    "Updated resource {1} on {0}",
+                                    "Update of resource {1} on '" + tiebreakerNodeName + "' applied on node {0}"
+                                )
+                            )
+                    );
+                }
+                else
+                {
+                    // noop, resource is already diskless as expected
+                }
+            }
+        }
+        else
+        {
+            LayerPayload payload = new LayerPayload();
+            DrbdRscPayload drbdRsc = payload.getDrbdRsc();
+            drbdRsc.nodeId = nodeIdInt;
+            drbdRsc.tcpPorts = portsRef == null ? null : new TreeSet<>(portsRef);
+            drbdRsc.portCount = portCountRef;
+            if (storPoolName != null)
+            {
+                // null if resource is created with "-d" (diskless)
+                StorPool storPool = ctrlApiDataLoader.loadStorPool(storPoolName, nodeNameStr);
+
+                Iterator<VolumeDefinition> vlmDfnIt = getVlmDfnIterator(rscDfn);
+                while (vlmDfnIt.hasNext())
+                {
+                    /*
+                     * We need to add this to avoid a chicken-egg problem:
+                     *
+                     * after creating the resource-instance, the RscFactory also creates all necessary layer-objects
+                     * the DRBD-layer-object needs to know whether or not the resource is placed within a shared storage
+                     * pool
+                     * however, we cannot ask the volumes of the resource, as those do not exist at the given time.
+                     * the resource-properties are also only copied into the resource-instance after its creation (duh)
+                     */
+                    VolumeDefinition vlmDfn = vlmDfnIt.next();
+                    payload.putStorageVlmPayload(
+                        RscLayerSuffixes.SUFFIX_DATA,
+                        vlmDfn.getVolumeNumber().value,
+                        storPool
+                    );
+                }
+            }
+
+            List<DeviceLayerKind> layerStack = getLayerstackOrBuildDefault(
+                layerDataHelper,
+                errorReporter,
+                layerStackStrListRef,
+                responses,
+                rscDfn
+            );
+
+            // compatibility
+            String storPoolNameStr = storPoolName;
+            @Nullable StorPool storPool = storPoolNameStr == null ?
+                null :
+                ctrlApiDataLoader.loadStorPoolOrNull(
+                    storPoolNameStr,
+                    nodeNameStr
+                );
+
+            boolean isStorPoolDiskless = false;
+            if (storPool != null)
+            {
+                DeviceProviderKind devProviderKind = storPool.getDeviceProviderKind();
+                isStorPoolDiskless = !devProviderKind.hasBackingDevice();
+            }
+
+            boolean isDisklessSet = FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.DISKLESS);
+            boolean isDrbdDisklessSet = FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.DRBD_DISKLESS);
+            boolean isNvmeInitiatorSet = FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.NVME_INITIATOR);
+            boolean isEbsInitiatorSet = FlagsHelper.isFlagEnabled(adjustedFlags, Resource.Flags.EBS_INITIATOR);
+
+            if (drbdClientRef != null && drbdClientRef && (isStorPoolDiskless || storPool == null))
+            {
+                adjustedFlags |= Resource.Flags.DRBD_DISKLESS.flagValue;
+                isDrbdDisklessSet = true;
+
+                payload.drbdRsc.rscFlags = payload.drbdRsc.rscFlags == null ?
+                    DrbdRscObject.DrbdRscFlags.CLIENT.flagValue :
+                    payload.drbdRsc.rscFlags | DrbdRscObject.DrbdRscFlags.CLIENT.flagValue;
+            }
+
+            if (
+                (isDisklessSet && !isDrbdDisklessSet && !isNvmeInitiatorSet && !isEbsInitiatorSet) ||
+                (!isDisklessSet && isStorPoolDiskless)
+            )
+            {
+                if (layerStack.isEmpty())
+                {
+                    adjustedFlags |= Resource.Flags.DRBD_DISKLESS.flagValue;
+                    responses.addEntry(makeFlaggedDrbdDisklessWarning(storPool));
+                }
+                else
+                {
+                    Flags disklessNvmeOrDrbd = CompatibilityUtils.mapDisklessFlagToNvmeOrDrbd(layerStack);
+                    if (storPool != null)
+                    {
+                        if (disklessNvmeOrDrbd.equals(Resource.Flags.DRBD_DISKLESS))
+                        {
+                            responses.addEntry(makeFlaggedDrbdDisklessWarning(storPool));
+                        }
+                        else
+                        {
+                            responses.addEntry(makeFlaggedNvmeInitiatorWarning(storPool));
+                        }
+                    }
+                    adjustedFlags |= disklessNvmeOrDrbd.flagValue;
+
+                    if (
+                        FlagsHelper.isFlagEnabled(
+                            adjustedFlags,
+                            Resource.Flags.DRBD_DISKLESS,
+                            Resource.Flags.NVME_INITIATOR
+                        )
+                    )
+                    {
+                        throw new ApiRcException(
+                            ApiCallRcImpl.simpleEntry(
+                                ApiConsts.FAIL_INVLD_LAYER_STACK,
+                                "Could not figure out how to interpret the deprecated --diskless flag."
+                            )
+                                .setDetails(
+                                    "The general DISKLESS flag is deprecated. If both layers, DRBD and NVME, should " +
+                                        "be used LINSTOR has to figure out if the resource should be diskful for " +
+                                        "DRBD (required NVME_INITIATOR) or diskless for DRBD " +
+                                        "(requires DRBD_DISKLESS). Using the deprecated DISKLESS flag is not " +
+                                        "supported for this case."
+                                )
+                                .setCorrection("Use either a non-deprecated flag or do not use both layers")
+                        );
+                    }
+                }
+            }
+
+            rsc = createResource(rscDfn, node, payload, adjustedFlags, layerStack);
+            Props rscProps = ctrlPropsHelper.getProps(rsc);
+
+            ctrlPropsHelper.fillProperties(
+                responses, LinStorObject.RSC, rscPropsMap, rscProps, ApiConsts.FAIL_ACC_DENIED_RSC
+            );
+
+            if (ctrlVlmCrtApiHelper.isDiskless(rsc) && storPoolNameStr == null)
+            {
+                rscProps.map().put(ApiConsts.KEY_STOR_POOL_NAME, LinStor.DISKLESS_STOR_POOL_NAME);
+            }
+
+            for (VolumeApi vlmApi : vlmApiList)
+            {
+                VolumeDefinition vlmDfn = loadVlmDfn(rscDfn, vlmApi.getVlmNr());
+
+                Volume vlmData = ctrlVlmCrtApiHelper.createVolumeResolvingStorPool(
+                    rsc,
+                    vlmDfn,
+                    thinFreeCapacities,
+                    Collections.emptyMap()
+                ).extractApiCallRc(responses);
+
+                Props vlmProps = ctrlPropsHelper.getProps(vlmData);
+
+                ctrlPropsHelper.fillProperties(
+                    responses, LinStorObject.VLM, vlmApi.getVlmProps(), vlmProps, ApiConsts.FAIL_ACC_DENIED_VLM
+                );
+            }
+
+            Iterator<VolumeDefinition> iterateVolumeDfn = getVlmDfnIterator(rscDfn);
+            while (iterateVolumeDfn.hasNext())
+            {
+                VolumeDefinition vlmDfn = iterateVolumeDfn.next();
+
+                // first check if we probably just deployed a vlm for this vlmDfn
+                if (rsc.getVolume(vlmDfn.getVolumeNumber()) == null)
+                {
+                    // not deployed yet.
+
+                    Volume vlm = ctrlVlmCrtApiHelper.createVolumeResolvingStorPool(
+                        rsc,
+                        vlmDfn,
+                        thinFreeCapacities,
+                        Collections.emptyMap()
+                    ).extractApiCallRc(responses);
+
+                    setDrbdPropsForThinVolumesIfNeeded(vlm);
+                }
+            }
+
+            rscMinIoSizeCheck(rsc, layerStack, canChangeMinIo);
+            resourceCreateCheck.checkCreatedResource(rsc);
+        }
+
+        if (isFlagSet(rsc, Resource.Flags.DELETE) || isFlagSet(rsc, Resource.Flags.DRBD_DELETE))
+        {
+            disableFlags(rsc, Resource.Flags.DELETE, Resource.Flags.DRBD_DELETE);
+            rsc.streamVolumes()
+                .forEach(
+                    vlm -> disableFlags(vlm, Volume.Flags.DELETE, Volume.Flags.DRBD_DELETE)
+                );
+
+            ResourceDataUtils.recalculateVolatileRscData(layerDataHelper, rsc);
+        }
+
+        if (!allowDualActiveSharedRef && !isFlagSet(rsc, Resource.Flags.INACTIVE) &&
+            !sharedRscMgr.isActivationAllowed(rsc))
+        {
+            autoFlux.add(ctrlRscActivateApiCallHandler.deactivateRsc(nodeNameStr, rscNameStr));
+        }
+
+        // a copy of a shared-SP resource also holds all snapshots of the resource-definition (the
+        // snapshot data lives once on the shared pool): create the per-node snapshot objects for the
+        // new copy and push them to its satellite, which otherwise would not know about the snapshots
+        // (and e.g. restore an empty volume instead of the snapshot) until its next full sync
+        List<SnapshotDefinition> newSnapObjs = ctrlSnapCrtHelper.ensureSnapshotObjectsPresent(rsc);
+        if (!newSnapObjs.isEmpty())
+        {
+            autoFlux.add(
+                ctrlSnapCrtHelper.updateSatellitesForNewSnapshotObjects(rsc.getResourceDefinition(), newSnapObjs)
+            );
+        }
+
+        return new PairNonNull<>(autoFlux, new ApiCallRcWith<>(responses, rsc));
+    }
+
+    private boolean disableTiebreakerFlag(Resource rscRef)
+    {
+        boolean changed;
+        try
+        {
+            changed = DrbdLayerUtils.setTiebreaker(rscRef, false);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+        return changed;
+    }
+
+    private boolean setClientFlag(Resource rscRef, @Nullable Boolean enableRef)
+    {
+        boolean changed;
+        try
+        {
+            changed = DrbdLayerUtils.setClientFlag(rscRef, enableRef);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+        return changed;
+    }
+    private void rscMinIoSizeCheck(
+        final Resource rsc,
+        final List<DeviceLayerKind> layerStack,
+        final boolean canChangeMinIo
+    )
+    {
+        final Iterator<VolumeDefinition> vlmDfnIter;
+        try
+        {
+            final ResourceDefinition rscDfn = rsc.getResourceDefinition();
+            vlmDfnIter = rscDfn.iterateVolumeDfn();
+
+            boolean hasSpecialLayers = LayerKindUtils.hasSpecialLayers(layerStack);
+            boolean haveChangedMinIo = false;
+            while (vlmDfnIter.hasNext())
+            {
+                final VolumeDefinition vlmDfn = vlmDfnIter.next();
+                final Props vlmDfnProps = vlmDfn.getProps();
+                final @Nullable String vlmBlockSizeStr = vlmDfnProps.getProp(
+                    InternalApiConsts.KEY_DRBD_BLOCK_SIZE,
+                    ApiConsts.NAMESPC_DRBD_DISK_OPTIONS
+                );
+                long vlmBlockSize = BlockSizeConsts.DFLT_PHY_IO_SIZE;
+                if (vlmBlockSizeStr != null)
+                {
+                    try
+                    {
+                        final long value = Long.parseLong(vlmBlockSizeStr);
+                        vlmBlockSize = MathUtils.bounds(
+                            BlockSizeConsts.MIN_PHY_IO_SIZE,
+                            value,
+                            BlockSizeConsts.MAX_PHY_IO_SIZE
+                        );
+                    }
+                    catch (NumberFormatException ignored)
+                    {
+                        errorReporter.logWarning(
+                            "Could not parse minIoSize '%s' of '%s', defaulting to %d", vlmBlockSizeStr,
+                            vlmDfn.toStringImpl(), vlmBlockSize
+                        );
+                    }
+                }
+
+                long poolBlockSize = hasSpecialLayers ?
+                    BlockSizeConsts.DFLT_SPECIAL_PHY_IO_SIZE : BlockSizeConsts.DFLT_PHY_IO_SIZE;
+
+                if (!hasSpecialLayers)
+                {
+                    Set<StorPool> storPools = LayerVlmUtils.getStorPools(rsc, false);
+                    for (StorPool storPool : storPools)
+                    {
+                        final Props poolProps;
+                        poolProps = storPool.getProps();
+                        final String poolBlockSizeStr = poolProps.getProp(
+                            StorageConstants.BLK_DEV_MIN_IO_SIZE,
+                            StorageConstants.NAMESPACE_INTERNAL
+                        );
+                        if (poolBlockSizeStr != null)
+                        {
+                            try
+                            {
+                                final long value = Long.parseLong(poolBlockSizeStr);
+                                poolBlockSize = MathUtils.bounds(
+                                    BlockSizeConsts.MIN_PHY_IO_SIZE,
+                                    value,
+                                    BlockSizeConsts.MAX_PHY_IO_SIZE
+                                );
+                            }
+                            catch (NumberFormatException ignored)
+                            {
+                                errorReporter.logWarning(
+                                    "Could not parse minIoSize '%s' of '%s', defaulting to %d",
+                                    poolBlockSizeStr, storPool.toStringImpl(), poolBlockSize
+                                );
+                            }
+                        }
+                    }
+                }
+
+                final boolean autoMinIoSizeForVlmDfn = minIoSizeHelper.isAutoMinIoSize(vlmDfn);
+                boolean minIoNeedsUpdate;
+                if (vlmBlockSizeStr == null)
+                {
+                    // if the property was not set until now, but autoMinIoSize is enabled, we need to set
+                    // the minio size property.
+                    minIoNeedsUpdate = autoMinIoSizeForVlmDfn;
+                }
+                else
+                {
+                    minIoNeedsUpdate = autoMinIoSizeForVlmDfn && poolBlockSize > vlmBlockSize;
+                }
+                if (minIoNeedsUpdate)
+                {
+                    if (canChangeMinIo)
+                    {
+                        // Set the changed minIoSize
+                        vlmDfn.setMinIoSize(poolBlockSize);
+                        if (rscDfn.getResourceCount() > 1)
+                        {
+                            // Only enable the "restart DRBD" property if this is NOT the very first resource we are
+                            // creating in the current RD
+                            haveChangedMinIo = true;
+                        }
+                    }
+                    else
+                    {
+                        // Cannot deploy if the target storage pool of any of the volumes has a larger
+                        // minimum I/O size than what's currently set in the volume definition
+                        throw new ApiRcException(
+                            ApiCallRcImpl.entryBuilder(
+                                ApiConsts.FAIL_INVLD_BLK_SIZE,
+                                "Cannot create resource \"" + rscDfn.getName().displayValue + "\" on node \"" +
+                                    rsc.getNode().getName().displayValue + "\", " +
+                                    "storage pool has an incompatible minimum I/O size"
+                            ).build()
+                        );
+                    }
+                }
+            }
+            if (haveChangedMinIo)
+            {
+                // Restart all DRBD resources if the minimum I/O size was changed
+                rscDfn.requireDrbdRestart();
+            }
+        }
+        catch (DatabaseException dbExc)
+        {
+            throw new ApiDatabaseException(dbExc);
+        }
+    }
+
+    static List<DeviceLayerKind> getLayerstackOrBuildDefault(
+        CtrlRscLayerDataFactory layerDataHelper,
+        ErrorReporter errorReporter,
+        List<String> layerStackStrListRef,
+        ApiCallRcImpl responses,
+        ResourceDefinition rscDfn
+    )
+    {
+        List<DeviceLayerKind> layerStack = LinstorParsingUtils.asDeviceLayerKind(layerStackStrListRef);
+
+        if (layerStack.isEmpty())
+        {
+            layerStack = getLayerStack(rscDfn);
+            if (layerStack.isEmpty())
+            {
+                Set<List<DeviceLayerKind>> existingLayerStacks = extractExistingLayerStacks(
+                    layerDataHelper,
+                    rscDfn
+                );
+                layerStack = switch (existingLayerStacks.size())
+                {
+                    // 0 -> ignore, will be filled later by CtrlLayerDataHelper#createDefaultLayerStack
+                    // but that method requires the resource to already exist.
+                    case 0 -> new ArrayList<>();
+                    case 1 -> existingLayerStacks.iterator().next();
+                    default -> throw new ApiRcException(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.FAIL_INVLD_LAYER_STACK,
+                            "Could not figure out what layer-list to default to."
+                        )
+                            .setDetails(
+                                "Layer lists of already existing resources: \n   " +
+                                    StringUtils.join(existingLayerStacks, "\n   ")
+                            )
+                            .setCorrection("Please specify a layer-list")
+                    );
+                };
+            }
+        }
+        else
+        {
+            if (!layerStack.get(layerStack.size() - 1).equals(DeviceLayerKind.STORAGE))
+            {
+                layerStack.add(DeviceLayerKind.STORAGE);
+                warnAddedStorageLayer(errorReporter, responses);
+            }
+        }
+        return layerStack;
+    }
+
+    private static void warnAddedStorageLayer(ErrorReporter errorReporter, ApiCallRcImpl responsesRef)
+    {
+        String warnMsg = "The layerstack was extended with STORAGE kind.";
+        errorReporter.logWarning(warnMsg);
+
+        responsesRef.addEntry(
+            ApiCallRcImpl.entryBuilder(
+                ApiConsts.WARN_STORAGE_KIND_ADDED,
+                warnMsg
+            )
+            .setDetails("Layer stacks have to be based on STORAGE kind. Layers configured to be diskless\n" +
+                "will not use the additional STORAGE layer.")
+            .build()
+        );
+    }
+
+    private void setDrbdPropsForThinVolumesIfNeeded(Volume vlmRef)
+    {
+        try
+        {
+            AbsRscLayerObject<Resource> rscLayerObj = vlmRef.getAbsResource().getLayerData();
+            if (LayerUtils.hasLayer(rscLayerObj, DeviceLayerKind.DRBD))
+            {
+                boolean hasThinStorPool = false;
+                boolean hasFatStorPool = false;
+                // only set true on ZFS, see internal gitlab issue 671 for details
+                boolean discardZerosIfAligned = false;
+
+                List<AbsRscLayerObject<Resource>> storageRscLayerObjList = LayerUtils.getChildLayerDataByKind(
+                    rscLayerObj,
+                    DeviceLayerKind.STORAGE
+                );
+                for (AbsRscLayerObject<Resource> storageRsc : storageRscLayerObjList)
+                {
+                    if (RscLayerSuffixes.isNonMetaDataLayerSuffix(storageRsc.getResourceNameSuffix()))
+                    {
+                        for (VlmProviderObject<Resource> storageVlm : storageRsc.getVlmLayerObjects().values())
+                        {
+                            StorPool storPool = storageVlm.getStorPool();
+                            DeviceProviderKind devProviderKind = storPool.getDeviceProviderKind();
+                            switch (devProviderKind)
+                            {
+                                case DISKLESS: // ignored
+                                    break;
+                                case LVM: // fall-through
+                                case SPDK: // fall-through
+                                case REMOTE_SPDK: // fall-through
+                                case EBS_INIT: // fall-through
+                                case EBS_TARGET: // fall-through
+                                case STORAGE_SPACES:
+                                    hasFatStorPool = true;
+                                    break;
+                                case FILE:
+                                    // TODO: introduce storage pool specific distinction about this
+                                    hasFatStorPool = true;
+                                    break;
+                                case LVM_THIN:
+                                    hasThinStorPool = true;
+                                    discardZerosIfAligned = true;
+                                    break;
+                                case ZFS:
+                                    hasFatStorPool = true;
+                                    discardZerosIfAligned = true;
+                                    break;
+                                case ZFS_THIN:
+                                    discardZerosIfAligned = true;
+                                    // fall-through
+                                case FILE_THIN:
+                                case STORAGE_SPACES_THIN:
+                                    hasThinStorPool = true;
+                                    break;
+                                case FAIL_BECAUSE_NOT_A_VLM_PROVIDER_BUT_A_VLM_LAYER:
+                                    // fall-through
+                                default:
+                                    throw new ImplementationError("Unknown deviceProviderKind: " + devProviderKind);
+                            }
+                        }
+                    }
+                }
+                if (hasThinStorPool && hasFatStorPool)
+                {
+                    throw new ApiRcException(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.FAIL_INVLD_STOR_DRIVER,
+                            "Mixing thin and thick storage pools are not allowed"
+                        )
+                    );
+                }
+
+                //TODO: make these default drbd-properties configurable (provider-specific?)
+
+                ResourceDefinition rscDfn = vlmRef.getVolumeDefinition().getResourceDefinition();
+                Props vlmDfnProps = vlmRef.getVolumeDefinition().getProps();
+                PriorityProps prioProps = new PriorityProps(vlmDfnProps,
+                    rscDfn.getProps(),
+                    rscDfn.getResourceGroup().getVolumeGroupProps(vlmRef.getVolumeNumber()),
+                    rscDfn.getResourceGroup().getProps()
+                );
+                if (prioProps.getProp("discard-zeroes-if-aligned", ApiConsts.NAMESPC_DRBD_DISK_OPTIONS) == null)
+                {
+                    vlmDfnProps.setProp(
+                        "discard-zeroes-if-aligned",
+                        discardZerosIfAligned ? "yes" : "no",
+                        ApiConsts.NAMESPC_DRBD_DISK_OPTIONS);
+                }
+            }
+        }
+        catch (InvalidKeyException | InvalidValueException exc)
+        {
+            throw new ImplementationError("Invalid hardcoded thin-volume related properties", exc);
+        }
+        catch (DatabaseException sqlExc)
+        {
+            throw new ApiDatabaseException(sqlExc);
+        }
+    }
+
+    public Flux<ApiCallRc> deployResources(ResponseContext context, Set<Resource> deployedResources)
+    {
+        return deployResources(context, deployedResources, true);
+    }
+
+    /**
+     * Get currently online node ids.
+     * @return A Map with resource to nodeid mapping
+     */
+    public static Map<Resource, Integer> getOnlineNodeIds(ResourceDefinition rscDfn)
+    {
+        Map<Resource, Integer> onlineNodeIds = new HashMap<>();
+        // deployedResources only contains the resources that were just created in the current API call, not the
+        // already existing ones
+        Iterator<Resource> rscIt = rscDfn.iterateResource();
+        while (rscIt.hasNext())
+        {
+            Resource rsc = rscIt.next();
+
+            /*
+             * do NOT wait for resources that are
+             * * not online
+             * * diskless DRBD
+             * * not an active DRBD (i.e. nvme target, inactive, etc...)
+             */
+            if (rsc.getNode().getPeer().getConnectionStatus().equals(ConnectionStatus.ONLINE) &&
+                !rsc.getStateFlags().isSet(Resource.Flags.DRBD_DISKLESS) &&
+                containsDrbdLayerData(rsc))
+            {
+                Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+                    rsc.getLayerData(),
+                    DeviceLayerKind.DRBD
+                );
+                if (drbdRscDataSet.size() > 1)
+                {
+                    throw new ImplementationError("Unexpected drbdRscDataSet size: " + drbdRscDataSet.size());
+                }
+                if (!drbdRscDataSet.isEmpty())
+                {
+                    onlineNodeIds.put(
+                        rsc,
+                        ((DrbdRscData<Resource>) drbdRscDataSet.iterator().next()).getNodeId().value
+                    );
+                }
+            }
+        }
+
+        return onlineNodeIds;
+    }
+
+    public Publisher<ApiCallRc> waitResourcesReady(
+        ResponseContext context,
+        ResourceDefinition rscDfn,
+        Set<Resource> deployedResources)
+    {
+        final ResourceName rscName = rscDfn.getName();
+        Publisher<ApiCallRc> readyResponses;
+        if (getVolumeDfnCountPrivileged(rscDfn) == 0)
+        {
+            // No DRBD resource is created when no volumes are present, so do not wait for it to be ready
+            readyResponses = Mono.just(responseConverter.addContextAll(
+                makeNoVolumesMessage(rscName), context, false));
+        }
+        else
+        if (allDiskless(rscDfn))
+        {
+            readyResponses = Mono.just(makeAllDisklessMessage(rscName));
+        }
+        else
+        {
+            Map<Resource, Integer> onlineNodeIds = getOnlineNodeIds(rscDfn);
+
+            List<Mono<ApiCallRc>> resourceReadyResponses = new ArrayList<>();
+            if (rscDfn.getResourceCount() > 1)
+            {
+                // if we are the first resource, there is no other DRBD peer to connect.
+
+                for (Resource rsc : deployedResources)
+                {
+                    if (DrbdLayerUtils.isAnyDrbdResourceExpected(rsc))
+                    {
+                        NodeName nodeName = rsc.getNode().getName();
+                        if (containsDrbdLayerData(rsc))
+                        {
+                            Map<Resource, Integer> onlinePeerdNodeIds = new HashMap<>(onlineNodeIds);
+                            onlinePeerdNodeIds.remove(rsc);
+
+                            resourceReadyResponses.add(
+                                eventWaiter
+                                    .waitForStream(
+                                        resourceStateEvent.get(),
+                                        // TODO if anything is allowed above DRBD, this resource-name must be adjusted
+                                        ObjectIdentifier.resource(nodeName, rscName)
+                                    )
+                                    .skipUntil(rscState -> rscState.isReady(onlinePeerdNodeIds.values()))
+                                    .timeout(Duration.ofMillis(DFLT_RSC_READY_WAIT_TIME_IN_MS))
+                                    .next()
+                                    .thenReturn(makeResourceReadyMessage(context, nodeName, rscName))
+                                    .onErrorResume(
+                                        PeerNotConnectedException.class,
+                                        ignored -> Mono.just(
+                                            ApiCallRcImpl.singletonApiCallRc(
+                                                ResponseUtils.makeNotConnectedWarning(nodeName)
+                                            )
+                                            )
+                                        )
+                                    .onErrorResume(TimeoutException.class, te -> makeRdyTimeoutApiRc(nodeName))
+                                    .onErrorResume(
+                                        EventStreamClosedException.class,
+                                        ignored -> Mono.empty()
+                                    )
+                            );
+                        }
+                    }
+                }
+            }
+
+            readyResponses = Flux.merge(resourceReadyResponses);
+        }
+        return readyResponses;
+    }
+
+    /**
+     * Deploy at least one resource of a resource definition to the satellites and wait for them to be ready.
+     */
+    public Flux<ApiCallRc> deployResources(
+        ResponseContext context,
+        Set<Resource> deployedResources,
+        boolean waitForReady)
+    {
+        long rscDfnCount = deployedResources.stream()
+            .map(Resource::getResourceDefinition)
+            .map(ResourceDefinition::getName)
+            .distinct()
+            .count();
+        if (rscDfnCount != 1)
+        {
+            throw new IllegalArgumentException("Resources belonging to precisely one resource definition expected");
+        }
+
+        ResourceDefinition rscDfn = deployedResources.iterator().next().getResourceDefinition();
+        ResourceName rscName = rscDfn.getName();
+
+        Set<NodeName> nodeNames = deployedResources.stream()
+            .map(Resource::getNode)
+            .map(Node::getName)
+            .collect(Collectors.toSet());
+
+        String nodeNamesStr = nodeNames.stream()
+            .map(NodeName::getDisplayName)
+            .map(displayName -> "''" + displayName + "''")
+            .collect(Collectors.joining(", "));
+
+        Publisher<ApiCallRc> readyResponses = waitForReady ?
+            waitResourcesReady(context, rscDfn, deployedResources) : Flux.empty();
+
+        Flux<ApiCallRc> nextSteps = setInitialized(deployedResources).concatWith(
+            scheduleBackupService.fluxAllNewTasks(rscDfn)
+        ).concatWith(ctrlRscDfnApiCallHandler.get().updateProps(rscDfn));
+
+        return ctrlSatelliteUpdateCaller.updateSatellites(
+            rscDfn,
+            nextSteps
+            // if failed, there is no need for the retry-task to wait for readyState
+            // this is only true as long as there is no other flux concatenated after readyResponses
+        )
+            .transform(updateResponses -> CtrlResponseUtils.combineResponses(
+                errorReporter,
+                updateResponses,
+                rscName,
+                nodeNames,
+                "Created resource {1} on {0}",
+                "Added peer(s) " + nodeNamesStr + " to resource {1} on {0}"
+                )
+            )
+            .concatWith(readyResponses)
+            .concatWith(nextSteps);
+    }
+
+    public Flux<ApiCallRc> setInitialized(Set<Resource> deployedResourcesRef)
+    {
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Create resource",
+                lockGuardFactory.buildDeferred(
+                    LockType.WRITE,
+                    LockObj.NODES_MAP,
+                    LockObj.RSC_DFN_MAP,
+                    LockObj.STOR_POOL_DFN_MAP
+                ),
+                () -> setInitializedInTransaction(deployedResourcesRef),
+                MDC.getCopyOfContextMap()
+            );
+    }
+
+    private Flux<ApiCallRc> setInitializedInTransaction(Set<Resource> deployedResourcesRef)
+    {
+        ResourceDefinition rscDfn = null;
+        Flux<ApiCallRc> flux;
+        try
+        {
+            for (Resource rsc : deployedResourcesRef)
+            {
+                // rsc might have been deleted.
+                // probably rsc-creation had a problem, resource got deleted again but the retryResource task still
+                // tried to continue. if it somehow managed (race-condition?) we might end up here...
+                // just ignore the resource and noop if needed.
+                if (!rsc.isDeleted())
+                {
+                    if (rscDfn == null)
+                    {
+                        rscDfn = rsc.getResourceDefinition();
+                    }
+                    List<AbsRscLayerObject<Resource>> drbdRscList = LayerUtils
+                        .getChildLayerDataByKind(rsc.getLayerData(), DeviceLayerKind.DRBD);
+                    for (AbsRscLayerObject<Resource> drbdRsc : drbdRscList)
+                    {
+                        ((DrbdRscData<Resource>) drbdRsc).getFlags().enableFlags(DrbdRscFlags.INITIALIZED);
+                    }
+                    allocationGranularityHelper.updateIfNeeded(rscDfn, false);
+                }
+            }
+            ctrlTransactionHelper.commit();
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+        if (rscDfn != null)
+        {
+            flux = ctrlSatelliteUpdateCaller.updateSatellites(
+                rscDfn,
+                null
+            ).thenMany(Flux.empty());
+            // user doesn't need info about setting an internal flag
+        }
+        else
+        {
+            flux = Flux.empty();
+        }
+        return flux;
+    }
+
+    private Mono<ApiCallRc> makeRdyTimeoutApiRc(NodeName nodeName)
+    {
+        final String msg = String.format(
+            "Resource did not become ready on node '%s' within" +
+            " reasonable time, check Satellite for errors.", nodeName);
+        ApiCallRcImpl.ApiCallRcEntry apiEntry = ApiCallRcImpl.entryBuilder(
+            ApiConsts.MASK_WARN | ApiConsts.MASK_RSC,
+            msg
+        )
+            .putObjRef(ApiConsts.KEY_NODE, nodeName.displayValue)
+            .build();
+        return Mono.just(ApiCallRcImpl.singletonApiCallRc(apiEntry));
+    }
+
+    public ApiCallRc makeResourceDidNotAppearMessage(ResponseContext context)
+    {
+        return ApiCallRcImpl.singletonApiCallRc(responseConverter.addContext(ApiCallRcImpl.simpleEntry(
+            ApiConsts.FAIL_UNKNOWN_ERROR,
+            "Deployed resource did not appear"
+        ), context, true));
+    }
+
+    public ApiCallRc makeEventStreamDisappearedUnexpectedlyMessage(ResponseContext context)
+    {
+        return ApiCallRcImpl.singletonApiCallRc(responseConverter.addContext(ApiCallRcImpl.simpleEntry(
+            ApiConsts.FAIL_UNKNOWN_ERROR,
+            "Resource disappeared while waiting for it to be ready"
+        ), context, true));
+    }
+
+    Resource createResource(
+        ResourceDefinition rscDfn,
+        Node node,
+        LayerPayload payload,
+        long flags,
+        List<DeviceLayerKind> layerStackRef
+    )
+    {
+        if (!layerStackRef.isEmpty())
+        {
+            ensureLayerStackIsAllowed(layerStackRef);
+        }
+
+        Resource rsc;
+        try
+        {
+            Resource.Flags[] initFlags = Resource.Flags.restoreFlags(flags);
+            boolean isDiskless = false;
+            for (Resource.Flags flag : initFlags)
+            {
+                if (flag == Resource.Flags.DISKLESS || flag == Resource.Flags.DRBD_DISKLESS)
+                {
+                    isDiskless = true;
+                    break;
+                }
+            }
+            if (!isDiskless)
+            {
+                // diskless resources do not need additional peer slots
+                checkPeerSlotsForNewPeer(rscDfn);
+            }
+
+            rsc = resourceFactory.create(
+                rscDfn,
+                node,
+                payload,
+                initFlags,
+                layerStackRef
+            );
+
+            copyForceInitialSyncProp(rsc);
+
+            List<DeviceLayerKind> unsupportedLayers = getUnsupportedLayers(rsc);
+            if (!unsupportedLayers.isEmpty())
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.FAIL_STLT_DOES_NOT_SUPPORT_LAYER,
+                        "Satellite '" + node.getName() + "' does not support the following layers: " + unsupportedLayers
+                    )
+                );
+            }
+        }
+        catch (DatabaseException sqlExc)
+        {
+            throw new ApiDatabaseException(sqlExc);
+        }
+        catch (LinStorDataAlreadyExistsException dataAlreadyExistsExc)
+        {
+            throw new ApiRcException(ApiCallRcImpl.simpleEntry(
+                ApiConsts.INFO_RSC_ALREADY_EXISTS,
+                "A " + getRscDescriptionInline(node, rscDfn) + " already exists.",
+                true
+            ), dataAlreadyExistsExc);
+        }
+        return rsc;
+    }
+
+    private void copyForceInitialSyncProp(Resource rsc) throws DatabaseException
+    {
+        ResourceDefinition rscDfn = rsc.getResourceDefinition();
+        PriorityProps prioProps = new PriorityProps(
+            rscDfn.getProps(),
+            rscDfn.getResourceGroup().getProps(),
+            ctrlPropsHelper.getStltPropsForView()
+        );
+        String forceSync = prioProps.getProp(ApiConsts.KEY_FORCE_INITIAL_SYNC, ApiConsts.NAMESPC_DRBD_OPTIONS);
+        if (forceSync != null && !forceSync.isEmpty() && Boolean.parseBoolean(forceSync))
+        {
+            try
+            {
+                rscDfn.getProps()
+                    .setProp(
+                        InternalApiConsts.KEY_FORCE_INITIAL_SYNC_PERMA,
+                        ApiConsts.VAL_TRUE,
+                        ApiConsts.NAMESPC_DRBD_OPTIONS
+                    );
+            }
+            catch (InvalidKeyException | InvalidValueException exc)
+            {
+                throw new ImplementationError(exc);
+            }
+        }
+    }
+
+    Resource createResourceFromSnapshot(
+        ResourceDefinition toRscDfn,
+        Node toNode,
+        Snapshot fromSnapshotRef,
+        boolean fromBackup,
+        Map<String, String> renameStorPoolMap,
+        @Nullable ApiCallRc apiCallRc
+    )
+    {
+        Resource rsc;
+        try
+        {
+            checkPeerSlotsForNewPeer(toRscDfn);
+
+            rsc = resourceFactory.create(
+                toRscDfn,
+                toNode,
+                fromSnapshotRef.getLayerData(),
+                new Resource.Flags[0],
+                fromBackup,
+                renameStorPoolMap,
+                apiCallRc
+            );
+        }
+        catch (DatabaseException sqlExc)
+        {
+            throw new ApiDatabaseException(sqlExc);
+        }
+        catch (LinStorDataAlreadyExistsException dataAlreadyExistsExc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_EXISTS_RSC,
+                    "A " + getRscDescriptionInline(toNode, toRscDfn) + " already exists.",
+                    true
+                ),
+                dataAlreadyExistsExc
+            );
+        }
+        return rsc;
+    }
+
+    static List<DeviceLayerKind> getUnsupportedLayers(Resource rsc)
+    {
+        List<DeviceLayerKind> usedDeviceLayerKinds = LayerUtils.getUsedDeviceLayerKinds(
+            rsc.getLayerData()
+        );
+        usedDeviceLayerKinds.removeAll(
+            rsc.getNode()
+                .getPeer()
+                .getExtToolsManager().getSupportedLayers()
+        );
+
+        return usedDeviceLayerKinds;
+    }
+
+    static void ensureLayerStackIsAllowed(List<DeviceLayerKind> layerStackRef)
+    {
+        if (!LayerUtils.isLayerKindStackAllowed(layerStackRef))
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_LAYER_STACK,
+                    "The layer stack " + layerStackRef + " is invalid"
+                )
+            );
+        }
+    }
+
+    private VolumeDefinition loadVlmDfn(
+        ResourceDefinition rscDfn,
+        int vlmNr
+    )
+    {
+        return loadVlmDfn(rscDfn, LinstorParsingUtils.asVlmNr(vlmNr));
+    }
+
+    private VolumeDefinition loadVlmDfn(
+        ResourceDefinition rscDfn,
+        VolumeNumber vlmNr
+    )
+    {
+        @Nullable VolumeDefinition vlmDfn = rscDfn.getVolumeDfn(vlmNr);
+
+        if (vlmDfn == null)
+        {
+            String rscName = rscDfn.getName().displayValue;
+            throw new ApiRcException(ApiCallRcImpl
+                .entryBuilder(
+                    ApiConsts.FAIL_NOT_FOUND_VLM_DFN,
+                    "Volume definition with number '" + vlmNr.value + "' on resource definition '" +
+                        rscName + "' not found."
+                )
+                .setCause("The specified volume definition with number '" + vlmNr.value +
+                    "' on resource definition '" + rscName + "' could not be found in the database")
+                .setCorrection("Create a volume definition with number '" + vlmNr.value +
+                    "' on resource definition '" + rscName + "' first.")
+                .build()
+            );
+        }
+
+        return vlmDfn;
+    }
+
+    private void checkPeerSlotsForNewPeer(ResourceDefinition rscDfn)
+    {
+        int resourceCount = 0;
+        Iterator<Resource> rscIter = rscDfn.iterateResource();
+        while (rscIter.hasNext())
+        {
+            Resource rsc = rscIter.next();
+            if (LayerUtils.hasLayer(rsc.getLayerData(), DeviceLayerKind.DRBD) &&
+                !rsc.isDrbdDiskless())
+            {
+                resourceCount++;
+            }
+        }
+
+        rscIter = rscDfn.iterateResource();
+        while (rscIter.hasNext())
+        {
+            Resource otherRsc = rscIter.next();
+
+            List<AbsRscLayerObject<Resource>> drbdRscDataList = LayerUtils.getChildLayerDataByKind(
+                otherRsc.getLayerData(),
+                DeviceLayerKind.DRBD
+            );
+
+            for (AbsRscLayerObject<Resource> rscLayerObj : drbdRscDataList)
+            {
+                if (((DrbdRscData<Resource>) rscLayerObj).getPeerSlots() < resourceCount)
+                {
+                    throw new ApiRcException(
+                        ApiCallRcImpl.simpleEntry(
+                            ApiConsts.FAIL_INSUFFICIENT_PEER_SLOTS,
+                            "Resource on node " + otherRsc.getNode().getName().displayValue +
+                            " has insufficient peer slots to add another peer"
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    Iterator<VolumeDefinition> getVlmDfnIterator(ResourceDefinition rscDfn)
+    {
+        Iterator<VolumeDefinition> iterator;
+        iterator = rscDfn.iterateVolumeDfn();
+        return iterator;
+    }
+
+    private int getVolumeDfnCountPrivileged(ResourceDefinition rscDfn)
+    {
+        int volumeDfnCount;
+        volumeDfnCount = rscDfn.getVolumeDfnCount();
+        return volumeDfnCount;
+    }
+
+    private boolean allDiskless(ResourceDefinition rscDfn)
+    {
+        boolean allDiskless = true;
+        Iterator<Resource> rscIter = rscDfn.iterateResource();
+        while (rscIter.hasNext())
+        {
+            StateFlags<Flags> stateFlags = rscIter.next().getStateFlags();
+            final boolean hasAnyDisklessFlagSet = stateFlags.isSomeSet(
+                Resource.Flags.DRBD_DISKLESS,
+                Resource.Flags.NVME_INITIATOR,
+                Resource.Flags.EBS_INITIATOR
+            );
+            if (!hasAnyDisklessFlagSet)
+            {
+                allDiskless = false;
+            }
+        }
+        return allDiskless;
+    }
+
+    private static boolean containsDrbdLayerData(Resource rsc)
+    {
+        boolean ret = false;
+        List<AbsRscLayerObject<Resource>> drbdLayerDataSet = LayerUtils.getChildLayerDataByKind(
+            rsc.getLayerData(),
+            DeviceLayerKind.DRBD
+        );
+        for (AbsRscLayerObject<Resource> drbdData : drbdLayerDataSet)
+        {
+            if (!drbdData.hasAnyPreventExecutionIgnoreReason())
+            {
+                ret = true;
+            }
+        }
+        return ret;
+    }
+
+    private ApiCallRc makeResourceReadyMessage(
+        ResponseContext context,
+        NodeName nodeName,
+        ResourceName rscName
+    )
+    {
+        return ApiCallRcImpl.singletonApiCallRc(responseConverter.addContext(ApiCallRcImpl.simpleEntry(
+            ApiConsts.CREATED,
+            "Resource '" + rscName + "' on '" + nodeName + "' ready"
+        ), context, true));
+    }
+
+    private ApiCallRcImpl makeNoVolumesMessage(ResourceName rscName)
+    {
+        return ApiCallRcImpl.singletonApiCallRc(ApiCallRcImpl.simpleEntry(
+            ApiConsts.WARN_NOT_FOUND,
+            "No volumes have been defined for resource '" + rscName + "'"
+        ));
+    }
+
+    private ApiCallRcImpl makeAllDisklessMessage(ResourceName rscName)
+    {
+        return ApiCallRcImpl.singletonApiCallRc(ApiCallRcImpl.simpleEntry(
+            ApiConsts.WARN_ALL_DISKLESS,
+            "Resource '" + rscName + "' is unusable because it is diskless on all its nodes"
+        ));
+    }
+
+    static List<DeviceLayerKind> getLayerStack(ResourceDefinition rscDfnRef)
+    {
+        List<DeviceLayerKind> layerStack;
+        layerStack = rscDfnRef.getLayerStack();
+        return layerStack;
+    }
+
+    static Set<List<DeviceLayerKind>> extractExistingLayerStacks(
+        CtrlRscLayerDataFactory layerDataHelperRef,
+        ResourceDefinition rscDfn
+    )
+    {
+        Set<List<DeviceLayerKind>> ret;
+        ret = rscDfn.streamResource().map(
+            layerDataHelperRef::getLayerStack
+        ).collect(Collectors.toSet());
+
+        /*
+         * We might have a toggle-disk here were we just removed the layer-data.
+         * Otherwise an empty layer list should not be possible anyways
+         */
+        ret.remove(Collections.emptyList());
+        return ret;
+    }
+
+    private boolean isNodeFlagSet(Node node, Node.Flags... flags)
+    {
+        boolean ret;
+        ret = node.getFlags().isSet(flags);
+        return ret;
+    }
+
+    private boolean isFlagSet(Resource rsc, Resource.Flags... flags)
+    {
+        boolean ret;
+        ret = rsc.getStateFlags().isSet(flags);
+        return ret;
+    }
+
+    private void disableFlags(Resource rsc, Resource.Flags... flags)
+    {
+        try
+        {
+            rsc.getStateFlags().disableFlags(flags);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    private void disableFlags(Volume vlm, Volume.Flags... flags)
+    {
+        try
+        {
+            vlm.getFlags().disableFlags(flags);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    private ApiCallRcImpl.ApiCallRcEntry makeFlaggedNvmeInitiatorWarning(StorPool storPool)
+    {
+        return makeFlaggedDiskless(storPool, "nvme initiator");
+    }
+
+    private ApiCallRcImpl.ApiCallRcEntry makeFlaggedDrbdDisklessWarning(StorPool storPool)
+    {
+        return makeFlaggedDiskless(storPool, "drbd diskless");
+    }
+
+    private ApiCallRcImpl.ApiCallRcEntry makeFlaggedDiskless(StorPool storPool, String type)
+    {
+        return ApiCallRcImpl
+            .entryBuilder(
+                MASK_WARN | MASK_STOR_POOL,
+                "Resource will be automatically flagged as " + type
+            )
+            .setCause(
+                String.format(
+                    "Used storage pool '%s' is diskless, but resource was not flagged %s",
+                    storPool.getName(),
+                    type
+                )
+            )
+            .build();
+    }
+
+}

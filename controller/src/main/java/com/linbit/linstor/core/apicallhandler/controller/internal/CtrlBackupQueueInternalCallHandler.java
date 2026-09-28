@@ -1,0 +1,955 @@
+package com.linbit.linstor.core.apicallhandler.controller.internal;
+
+import com.linbit.ImplementationError;
+import com.linbit.InvalidNameException;
+import com.linbit.linstor.InternalApiConsts;
+import com.linbit.linstor.PriorityProps;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.api.pojo.backups.BackupNodeQueuesPojo;
+import com.linbit.linstor.api.pojo.backups.BackupSnapQueuesPojo;
+import com.linbit.linstor.backupshipping.BackupShippingUtils;
+import com.linbit.linstor.core.BackupInfoManager;
+import com.linbit.linstor.core.BackupInfoManager.QueueItem;
+import com.linbit.linstor.core.LinStor;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.backup.CtrlBackupApiHelper;
+import com.linbit.linstor.core.apicallhandler.controller.backup.CtrlBackupCreateApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.backup.CtrlBackupL2LSrcApiCallHandler;
+import com.linbit.linstor.core.apicallhandler.controller.backup.l2l.rest.BackupShippingRestClient;
+import com.linbit.linstor.core.apicallhandler.controller.backup.l2l.rest.data.BackupShippingRequestPrevSnap;
+import com.linbit.linstor.core.apicallhandler.controller.backup.l2l.rest.data.BackupShippingResponsePrevSnap;
+import com.linbit.linstor.core.apicallhandler.controller.backup.l2l.rest.data.BackupShippingSrcData;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Snapshot;
+import com.linbit.linstor.core.objects.SnapshotDefinition;
+import com.linbit.linstor.core.objects.remotes.AbsRemote;
+import com.linbit.linstor.core.objects.remotes.LinstorRemote;
+import com.linbit.linstor.core.objects.remotes.S3Remote;
+import com.linbit.linstor.core.objects.remotes.StltRemote;
+import com.linbit.linstor.core.repository.NodeRepository;
+import com.linbit.linstor.core.repository.SystemConfRepositoryImpl;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.Peer;
+import com.linbit.linstor.propscon.ReadOnlyProps;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.Function;
+import java.util.function.Predicate;
+
+import reactor.core.publisher.Flux;
+
+@Singleton
+public class CtrlBackupQueueInternalCallHandler
+{
+    private final ScopeRunner scopeRunner;
+    private final LockGuardFactory lockGuardFactory;
+    private final Provider<Peer> peerProvider;
+    private final BackupInfoManager backupInfoMgr;
+    private final BackupShippingRestClient restClient;
+    private final Provider<CtrlBackupL2LSrcApiCallHandler> backupL2LSrcHandler;
+    private final CtrlBackupCreateApiCallHandler backupCrtHandler;
+    private final NodeRepository nodeRepo;
+    private final SystemConfRepositoryImpl sysCfgRepo;
+    private final CtrlBackupApiHelper backupHelper;
+    private final ErrorReporter errorReporter;
+
+    @Inject
+    public CtrlBackupQueueInternalCallHandler(
+        ScopeRunner scopeRunnerRef,
+        LockGuardFactory lockGuardFactoryRef,
+        Provider<Peer> peerProviderRef,
+        BackupInfoManager backupInfoMgrRef,
+        BackupShippingRestClient restClientRef,
+        Provider<CtrlBackupL2LSrcApiCallHandler> backupL2LSrcHandlerRef,
+        CtrlBackupCreateApiCallHandler backupCrtHandlerRef,
+        NodeRepository nodeRepoRef,
+        SystemConfRepositoryImpl sysCfgRepoRef,
+        CtrlBackupApiHelper backupHelperRef,
+        ErrorReporter errorReporterRef
+    )
+    {
+        scopeRunner = scopeRunnerRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        peerProvider = peerProviderRef;
+        backupInfoMgr = backupInfoMgrRef;
+        restClient = restClientRef;
+        backupL2LSrcHandler = backupL2LSrcHandlerRef;
+        backupCrtHandler = backupCrtHandlerRef;
+        nodeRepo = nodeRepoRef;
+        sysCfgRepo = sysCfgRepoRef;
+        backupHelper = backupHelperRef;
+        errorReporter = errorReporterRef;
+
+    }
+
+    public Flux<ApiCallRc> handleBackupQueues(
+        @Nullable SnapshotDefinition snapDfn,
+        AbsRemote remoteForSchedule,
+        @Nullable StltRemote optStltRemote
+    )
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        /*
+         * Only after a node finishes a shipment will other backups queued on that node get a chance to get
+         * started.
+         * This does not necessarily have to happen in order, in case the oldest queued backup cannot be started
+         * right now, the next entry in the queue will be chosen instead.
+         * Since this is the only spot where new shipments can be started, a problem arises when it comes to
+         * incremental backups. Unless the previous backup has already finished shipping, an incremental backup
+         * always needs to be queued. This might lead to non-empty queues on nodes that are currently not
+         * shipping anything. As elaborated before, those queued backups would never be able to start on those
+         * nodes since there is no shipment that could trigger the queue.
+         * Therefore, getFollowUpSnaps is used to figure out if the backup that just finished shipping has an
+         * incremental backup queued on any node, and if so, to start it, giving those nodes a chance to start a
+         * shipment as well. Additionally this leads to a chance at filling newly added shipping slots up
+         * sooner with the incremental backups getFollowUpSnaps provides.
+         */
+        if (snapDfn != null)
+        {
+            Map<QueueItem, TreeSet<Node>> followUpSnaps = backupInfoMgr.getFollowUpSnaps(
+                snapDfn,
+                remoteForSchedule
+            );
+
+            /*
+             * no flux-loop needed here, because neither the for-loops nor backupInfoMgr.getFollowUpSnaps remove
+             * queueItems from any queue
+             */
+            for (Entry<QueueItem, TreeSet<Node>> entry : followUpSnaps.entrySet())
+            {
+                QueueItem queueItem = entry.getKey();
+                for (Node currentNode : entry.getValue())
+                {
+                    if (backupCrtHandler.getFreeShippingSlots(currentNode) > 0)
+                    {
+                        Iterator<QueueItem> next = new IteratorFromSingleItem(
+                            queueItem
+                        );
+                        flux = flux.concatWith(startQueuedShippings(currentNode, next));
+                    }
+                }
+            }
+        }
+        // If the previous loop didn't fill all shipping slots of this node, start more shipments here
+
+        // TODO: do not delete stlt remote when src is done, instead start new task & save it in the stlt-remote. If dst
+        // tells us it's done, delete stlt-remote and task, then continue. If task triggers first, delete stlt-remote
+        // then and continue - error might still happen, but at this point there isn't really anything we can do.
+        // Although it would be possible to ask dst at this point what's taking it so long and then maybe wait a bit
+        // more...
+        Node node;
+        if (optStltRemote != null)
+        {
+            node = optStltRemote.getNode();
+            flux = flux.concatWith(backupHelper.cleanupStltRemote(optStltRemote));
+        }
+        else
+        {
+            node = peerProvider.get().getNode();
+        }
+        // no need to continue with starting queues if the node was deleted
+        boolean nodeDeleted = node.isDeleted() || node.getFlags().isSet(Node.Flags.DELETE);
+        if (!nodeDeleted && backupCrtHandler.getFreeShippingSlots(node) > 0)
+        {
+            flux = flux.concatWith(
+                startMultipleQueuedShippings(
+                    node,
+                    new IteratorFromBackupNodeQueue(node, backupInfoMgr)
+                )
+            );
+        }
+        return flux;
+    }
+
+    /**
+     * Calls startQueuedShippings until the given node either has no free shipping slots left, or the supplier stops
+     * returning items.
+     */
+    public Flux<ApiCallRc> startMultipleQueuedShippings(
+        Node node,
+        Iterator<QueueItem> nextItem
+    )
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Start multiple queued shippings",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> startMultipleQueuedShippingsInTransaction(node, nextItem)
+        );
+    }
+
+    private Flux<ApiCallRc> startMultipleQueuedShippingsInTransaction(
+        Node node,
+        Iterator<QueueItem> nextItem
+    )
+    {
+        Flux<ApiCallRc> flux;
+        if (backupCrtHandler.getFreeShippingSlots(node) > 0 && nextItem.hasNext())
+        {
+            flux = startQueuedShippings(node, nextItem).concatWith(startMultipleQueuedShippings(node, nextItem));
+        }
+        else
+        {
+            flux = Flux.empty();
+        }
+        return flux;
+    }
+
+    /**
+     * Starts a shipping for the next QueueItem from the supplier or queues it again if it can't be started at the
+     * moment, until one shipping was started on the given node or the supplier stops returning items.
+     */
+    private Flux<ApiCallRc> startQueuedShippings(
+        Node node,
+        Iterator<QueueItem> nextItem
+    )
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "Start queued shippings",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> startQueuedShippingsInTransaction(node, nextItem)
+        );
+    }
+
+    private Flux<ApiCallRc> startQueuedShippingsInTransaction(
+        Node node,
+        Iterator<QueueItem> nextItem
+    )
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        try
+        {
+            /*
+             * make sure to check free shipping slots before calling nextItem.next(), so that we don't consume an extra
+             * item from the queue
+             */
+            if (backupCrtHandler.getFreeShippingSlots(node) > 0)
+            {
+                QueueItem next = nextItem.next();
+                /*
+                 * While prevSnapDfn may be null here (indicating a full backup should be made), a new base snapshot
+                 * needs to be decided upon if it was deleted while in the queue.
+                 * In case of an l2l-shipping always get a new prevSnap, since the snap could have been deleted on the
+                 * target side as well
+                 */
+                if (next != null)
+                {
+                    if (next.alreadyStartedOn != null)
+                    {
+                        /*
+                         * although there should be no case where nextItem is not a IteratorFromSingleItem when we get
+                         * here, having this in case it does happen should do no harm
+                         */
+                        if (nextItem.hasNext())
+                        {
+                            flux = startQueuedShippingsInTransaction(node, nextItem);
+                        }
+                    }
+                    else
+                    {
+                        /*
+                         * next.alreadyStartedOn can always be set to the current node, since a) the value itself is
+                         * currently not used and b) in the case where the value might be useful, we have a queueItem
+                         * that came from getFullowUpShippings, which means we know its prevSnap is valid and it will
+                         * therefore be started on this specific node.
+                         */
+                        next.alreadyStartedOn = node;
+                        if (next.s3orLinRemote instanceof S3Remote)
+                        {
+                            flux = handleS3QueueItem(node, nextItem, next);
+                        }
+                        else if (next.s3orLinRemote instanceof LinstorRemote)
+                        {
+                            flux = handleL2LQueueItem(node, nextItem, next);
+                        }
+                        else
+                        {
+                            throw new ImplementationError(
+                                "Unexpected Remote type: " + next.s3orLinRemote.getClass().getSimpleName()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        catch (InvalidNameException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+        return flux;
+    }
+
+    private Flux<ApiCallRc> handleS3QueueItem(
+        Node node,
+        Iterator<QueueItem> nextItem,
+        QueueItem current
+    ) throws InvalidNameException, ImplementationError
+    {
+        SnapshotDefinition prevSnapDfn = current.prevSnapDfn;
+        Flux<ApiCallRc> flux = Flux.empty();
+        // nodeForShipping is the node that the queueItem will be started on, and while in the best case it will be the
+        // same as node (the node we want to start shippings on), it might not always be
+        Node nodeForShipping = node;
+        boolean needsNewPrefSnapDfn = false;
+        /*
+         * while prevSnapDfn may be null here (indicating a full backup should be made), a new base
+         * snapshot needs to be decided upon if it was deleted while in the queue
+         */
+        if (prevSnapDfn != null)
+        {
+            if (
+                prevSnapDfn.isDeleted() ||
+                    prevSnapDfn.getFlags().isSet(SnapshotDefinition.Flags.DELETE) ||
+                    !BackupShippingUtils.hasShippingStatus(
+                        prevSnapDfn,
+                        current.s3orLinRemote.getName().displayValue,
+                        InternalApiConsts.VALUE_SUCCESS
+                    )
+            )
+            {
+                /*
+                 * This method assumes that the prevSnapDfn already has the SHIPPED flag set. Should
+                 * this not be the case, a new prevSnap is needed since allowing the shipping to
+                 * start based on an unfinished shipping is simply a bad idea
+                 */
+                needsNewPrefSnapDfn = true;
+            }
+            else
+            {
+                Snapshot snap = prevSnapDfn.getSnapshot(node.getName());
+                needsNewPrefSnapDfn = snap == null ||
+                    snap.isDeleted() ||
+                    snap.getFlags().isSet(Snapshot.Flags.DELETE);
+            }
+        }
+        if (needsNewPrefSnapDfn)
+        {
+            prevSnapDfn = backupCrtHandler.getIncrementalBase(
+                current.snapDfn.getResourceDefinition(),
+                current.s3orLinRemote,
+                true,
+                true
+            );
+            if (prevSnapDfn != null && prevSnapDfn.getSnapshot(node.getName()) == null)
+            {
+                // if the current node does not have the new prevSnap, a new node needs to be chosen
+                // as well
+                boolean queueAnyways = !BackupShippingUtils.hasShippingStatus(
+                    prevSnapDfn,
+                    current.s3orLinRemote.getName().displayValue,
+                    InternalApiConsts.VALUE_SUCCESS
+                );
+                // nodeForShipping will be null if snap gets queued in the method
+                nodeForShipping = backupCrtHandler.getNodeForBackupOrQueue(
+                    current.snapDfn.getResourceDefinition(),
+                    prevSnapDfn,
+                    current.snapDfn,
+                    current.s3orLinRemote,
+                    current.preferredNode,
+                    new ApiCallRcImpl(),
+                    queueAnyways,
+                    null,
+                    current.shipExistingSnap,
+                    false
+                );
+            }
+        }
+        if (nodeForShipping != null)
+        {
+            // call the "...InTransaction" directly to make sure flags are set immediately
+            flux = backupCrtHandler.startShippingInTransaction(
+                current.snapDfn,
+                nodeForShipping,
+                current.s3orLinRemote,
+                prevSnapDfn,
+                new ApiCallRcImpl(),
+                current.preferredNode,
+                current.l2lData,
+                current.shipExistingSnap
+            );
+        }
+        if (!node.equals(nodeForShipping) && nextItem.hasNext())
+        {
+            // s3 can call inTransaction because it does not need to wait
+            flux = flux.concatWith(startQueuedShippingsInTransaction(node, nextItem));
+        }
+        return flux;
+    }
+
+    private Flux<ApiCallRc> handleL2LQueueItem(
+        Node node,
+        Iterator<QueueItem> nextItem,
+        QueueItem current
+    )
+    {
+        Flux<ApiCallRc> flux;
+        Set<String> srcSnapDfnUuids = new HashSet<>();
+        for (SnapshotDefinition snapDfn : current.snapDfn.getResourceDefinition().getSnapshotDfns())
+        {
+            if (!snapDfn.getAllSnapshots().isEmpty())
+            {
+                srcSnapDfnUuids.add(snapDfn.getUuid().toString());
+            }
+        }
+        final @Nullable BackupShippingSrcData l2lData = current.l2lData;
+        if (l2lData == null)
+        {
+            throw new ImplementationError("The QueueItem is missing its l2lData");
+        }
+        flux = Flux.merge(
+            restClient.sendPrevSnapRequest(
+                new BackupShippingRequestPrevSnap(
+                    LinStor.VERSION_INFO_PROVIDER.getSemanticVersion(),
+                    l2lData.getSrcClusterId(),
+                    l2lData.getDstRscName(),
+                    srcSnapDfnUuids,
+                    l2lData.getDstNodeName()
+                ),
+                (LinstorRemote) current.s3orLinRemote
+            ).doOnError(IOException.class, exc ->
+            {
+                errorReporter.logError(
+                    "sending prevSnap request to remote " + current.s3orLinRemote +
+                        "failed. Removing all backups queued to this remote"
+                );
+                backupInfoMgr.deleteFromQueue(current.s3orLinRemote);
+                errorReporter.reportError(exc);
+            })
+                .map(
+                    resp -> scopeRunner.fluxInTransactionalScope(
+                        "Backup shipping L2L: start queued shipping",
+                        lockGuardFactory.create()
+                            .read(LockObj.NODES_MAP)
+                            .write(LockObj.RSC_DFN_MAP)
+                            .buildDeferred(),
+                        () -> startQueuedL2LShippingInTransaction(node, nextItem, current, resp)
+                    )
+                )
+        );
+        return flux;
+    }
+
+    private Flux<ApiCallRc> startQueuedL2LShippingInTransaction(
+        Node node,
+        Iterator<QueueItem> nextItem,
+        QueueItem next,
+        BackupShippingResponsePrevSnap resp
+    ) throws ImplementationError
+    {
+        Flux<ApiCallRc> ret;
+        Node l2lNodeForShipping = null;
+        if (!resp.canReceive)
+        {
+            ret = Flux.just(resp.responses);
+        }
+        else
+        {
+            @Nullable final BackupShippingSrcData l2lData = next.l2lData;
+            if (l2lData == null)
+            {
+                throw new ImplementationError("The QueueItem is missing its l2lData");
+            }
+            l2lData.setResetData(resp.resetData);
+            l2lData.setDstBaseSnapName(resp.dstBaseSnapName);
+            l2lData.setDstActualNodeName(resp.dstActualNodeName);
+            SnapshotDefinition l2lPrevSnapDfn = backupCrtHandler.getIncrementalBaseL2L(
+                next.snapDfn.getResourceDefinition(),
+                resp.prevSnapUuid,
+                next.s3orLinRemote.getName(),
+                next.prevSnapDfn != null,
+                resp.responses,
+                l2lData.getDstRscName()
+            );
+            boolean queueAnyways = l2lPrevSnapDfn != null && !BackupShippingUtils.hasShippingStatus(
+                l2lPrevSnapDfn,
+                next.s3orLinRemote.getName().displayValue,
+                InternalApiConsts.VALUE_SUCCESS
+            );
+            l2lNodeForShipping = backupCrtHandler.getNodeForBackupOrQueue(
+                next.snapDfn.getResourceDefinition(),
+                l2lPrevSnapDfn,
+                next.snapDfn,
+                next.s3orLinRemote,
+                next.preferredNode,
+                new ApiCallRcImpl(),
+                queueAnyways,
+                l2lData,
+                next.shipExistingSnap,
+                false
+            );
+            if (l2lNodeForShipping != null)
+            {
+                l2lData.setSrcSnapshot(
+                    next.snapDfn.getSnapshot(l2lNodeForShipping.getName())
+                );
+                l2lData.setSrcNodeName(l2lNodeForShipping.getName().displayValue);
+                final Node nodeForEffectivelyFinal = l2lNodeForShipping;
+                ret = backupCrtHandler.startShippingInTransaction(
+                    next.snapDfn,
+                    l2lNodeForShipping,
+                    next.s3orLinRemote,
+                    l2lPrevSnapDfn,
+                    new ApiCallRcImpl(),
+                    next.preferredNode,
+                    l2lData,
+                    next.shipExistingSnap
+                )
+                    .concatWith(
+                        scopeRunner.fluxInTransactionalScope(
+                            "Backup shipping L2L: Create Stlt-Remote",
+                            lockGuardFactory.create()
+                                .read(LockObj.NODES_MAP)
+                                .write(LockObj.RSC_DFN_MAP)
+                                .buildDeferred(),
+                            () -> backupL2LSrcHandler.get()
+                                .createStltRemoteInTransaction(l2lData, nodeForEffectivelyFinal)
+                        )
+                    );
+            }
+            else
+            {
+                if (!resp.responses.isEmpty())
+                {
+                    ret = Flux.just(resp.responses);
+                }
+                else
+                {
+                    ret = Flux.empty();
+                }
+            }
+        }
+        if (!node.equals(l2lNodeForShipping) && nextItem.hasNext())
+        {
+            ret = ret.concatWith(startQueuedShippings(node, nextItem));
+        }
+        return ret;
+    }
+
+    public Flux<ApiCallRc> maxConcurrentShippingsChangedForCtrl()
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "BackupsPerNode changed on ctrl",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            this::maxConcurrentShippingsChangedForCtrlInTransaction
+        );
+    }
+
+    public Flux<ApiCallRc> maxConcurrentShippingsChangedForNode(Node node)
+    {
+        return scopeRunner.fluxInTransactionalScope(
+            "BackupsPerNode changed on node",
+            lockGuardFactory.create()
+                .read(LockObj.NODES_MAP)
+                .write(LockObj.RSC_DFN_MAP)
+                .buildDeferred(),
+            () -> maxConcurrentShippingsChangedForNodeInTransaction(node)
+        );
+    }
+
+    /**
+     * Starts new shipments or deletes queues depending on the changes to the prop
+     * "BackupShipping/MaxConcurrentBackupsPerNode".
+     * This method needs to be called in a scope with all the locks needed for starting a shipping, since in case
+     * a shipping needs to be started startShippingInTransaction will be called directly.
+     */
+    private Flux<ApiCallRc> maxConcurrentShippingsChangedForNodeInTransaction(Node node)
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        PriorityProps prioProps = new PriorityProps(
+            node.getProps(),
+            sysCfgRepo.getCtrlConfForView()
+        );
+        String maxBackups = prioProps.getProp(
+            ApiConsts.KEY_MAX_CONCURRENT_BACKUPS_PER_NODE,
+            ApiConsts.NAMESPC_BACKUP_SHIPPING
+        );
+        if (maxBackups != null && !maxBackups.isEmpty() && Integer.parseInt(maxBackups) == 0)
+        {
+            flux = backupCrtHandler.deleteNodeQueueAndReQueueSnapsIfNeeded(node);
+        }
+        else
+        {
+            if (backupCrtHandler.getFreeShippingSlots(node) > 0)
+            {
+                flux = startMultipleQueuedShippings(
+                    node,
+                    new IteratorFromBackupNodeQueue(node, backupInfoMgr)
+                );
+            }
+        }
+        return flux;
+    }
+
+    /**
+     * Starts new shipments or deletes queues depending on the changes to the prop
+     * "BackupShipping/MaxConcurrentBackupsPerNode".
+     * This method needs to be called in a scope with all the locks needed for starting a shipping, since in case
+     * a shipping needs to be started startShippingInTransaction will be called directly.
+     */
+    private Flux<ApiCallRc> maxConcurrentShippingsChangedForCtrlInTransaction()
+    {
+        Flux<ApiCallRc> flux = Flux.empty();
+        Collection<Node> nodes = nodeRepo.getMapForView().values();
+        List<Node> nodesToClear = new ArrayList<>();
+        List<Node> nodesToStart = new ArrayList<>();
+        int toClearCt = 0;
+        for (Node node : nodes)
+        {
+            ReadOnlyProps nodeProps = node.getProps();
+            PriorityProps prioProps = new PriorityProps(
+                nodeProps,
+                sysCfgRepo.getCtrlConfForView()
+            );
+            String maxBackups = prioProps.getProp(
+                ApiConsts.KEY_MAX_CONCURRENT_BACKUPS_PER_NODE,
+                ApiConsts.NAMESPC_BACKUP_SHIPPING
+            );
+            String nodeMaxBackups = nodeProps.getProp(
+                ApiConsts.KEY_MAX_CONCURRENT_BACKUPS_PER_NODE,
+                ApiConsts.NAMESPC_BACKUP_SHIPPING
+            );
+            if (maxBackups != null && !maxBackups.isEmpty() && Integer.parseInt(maxBackups) == 0)
+            {
+                toClearCt++;
+                if (nodeMaxBackups == null)
+                {
+                    // since prop is not set on node level, the value changed and therefore the node-queue needs
+                    // to be deleted
+                    nodesToClear.add(node);
+                }
+            }
+            else
+            {
+                if (nodeMaxBackups == null)
+                {
+                    // since prop is not set on node level, the value changed and therefore checking whether new
+                    // shippings can be started is necessary
+                    nodesToStart.add(node);
+                }
+            }
+        }
+        if (toClearCt == nodes.size())
+        {
+            // clear everything, no need to try and add to other queue, since all shipping should be stopped
+            backupInfoMgr.deleteAllQueues();
+        }
+        else
+        {
+            for (Node node : nodesToClear)
+            {
+                flux = flux.concatWith(backupCrtHandler.deleteNodeQueueAndReQueueSnapsIfNeeded(node));
+            }
+            for (Node node : nodesToStart)
+            {
+                /*
+                 * This is just a pre-filter; since the result of getFreeShippingSlots() changes due to the results of
+                 * the following flux(es), we cannot be certain that the result of this if is still valid when we get to
+                 * actually trying to start shipments, which is why there are additional checks for
+                 * getFreeShippingSlots() later on
+                 */
+                if (backupCrtHandler.getFreeShippingSlots(node) > 0)
+                {
+                    flux = flux.concatWith(
+                        startMultipleQueuedShippings(
+                            node,
+                            new IteratorFromBackupNodeQueue(node, backupInfoMgr)
+                        )
+                    );
+                }
+            }
+        }
+        return flux;
+    }
+
+    public List<BackupSnapQueuesPojo> listSnapQueues(
+        List<String> nodesRef,
+        List<String> snapshotsRef,
+        List<String> resourcesRef,
+        List<String> remotesRef
+    )
+    {
+        List<BackupSnapQueuesPojo> ret = new ArrayList<>();
+        Predicate<QueueItem> snapFilter = createFilter(snapshotsRef, item -> item.snapDfn.getName().displayValue);
+        Predicate<QueueItem> rscFilter = createFilter(
+            resourcesRef,
+            item -> item.snapDfn.getResourceName().displayValue
+        );
+        Predicate<QueueItem> remoteFilter = createFilter(remotesRef, item -> item.s3orLinRemote.getName().displayValue);
+        Predicate<String> nodeFilter = createFilter(nodesRef, Function.identity());
+
+        Map<QueueItem, Set<String>> queueMap = getSnapToNodeQueueMap();
+        for (Entry<QueueItem, Set<String>> queue : queueMap.entrySet())
+        {
+            QueueItem item = queue.getKey();
+            boolean matches = snapFilter.test(item) || rscFilter.test(item) || remoteFilter.test(item);
+            if (!matches)
+            {
+                for (String node : queue.getValue())
+                {
+                    if (nodeFilter.test(node))
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+            BackupSnapQueuesPojo snapQueuesPojo = createSnapQueuesPojo(queue.getValue(), item, matches);
+            if (snapQueuesPojo != null)
+            {
+                ret.add(snapQueuesPojo);
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * Compiles a map of QueueItem to a set of node names (as Strings) from two sources:
+     * backupInfoMgr.getSnapToNodeQueues() and backupInfoMgr.getPrevNodeUndecidedQueue().
+     * The QueueItems from the latter get ApiConsts.VAL_NODE_UNDECIDED set as a node name.
+     */
+    private Map<QueueItem, Set<String>> getSnapToNodeQueueMap()
+    {
+        Map<QueueItem, Set<String>> queueMap = new HashMap<>();
+        for (Entry<QueueItem, Set<Node>> queue : backupInfoMgr.getSnapToNodeQueues())
+        {
+            Set<String> nodeStrs = new HashSet<>();
+            queueMap.put(queue.getKey(), nodeStrs);
+            for (Node node : queue.getValue())
+            {
+                nodeStrs.add(node.getName().displayValue);
+            }
+        }
+        for (QueueItem item : backupInfoMgr.getPrevNodeUndecidedQueue())
+        {
+            // for queueItems where it is still unknown on which nodes they can be shipped
+            queueMap.put(item, Collections.singleton(ApiConsts.VAL_NODE_UNDECIDED));
+        }
+        return queueMap;
+    }
+
+    private @Nullable BackupSnapQueuesPojo createSnapQueuesPojo(
+        Set<String> queuedOnNodes,
+        QueueItem item,
+        boolean matches
+    )
+    {
+        BackupSnapQueuesPojo ret = null;
+        if (matches)
+        {
+            List<BackupNodeQueuesPojo> nodes = new ArrayList<>();
+            for (String node : queuedOnNodes)
+            {
+                nodes.add(new BackupNodeQueuesPojo(node, null));
+            }
+            if (!nodes.isEmpty())
+            {
+                ret = queueItemToPojo(item, nodes);
+            }
+        }
+        return ret;
+    }
+
+    public List<BackupNodeQueuesPojo> listNodeQueues(
+        List<String> nodesRef,
+        List<String> snapshotsRef,
+        List<String> resourcesRef,
+        List<String> remotesRef
+    )
+    {
+        List<BackupNodeQueuesPojo> ret = new ArrayList<>();
+        Predicate<QueueItem> snapFilter = createFilter(snapshotsRef, item -> item.snapDfn.getName().displayValue);
+        Predicate<QueueItem> rscFilter = createFilter(
+            resourcesRef,
+            item -> item.snapDfn.getResourceName().displayValue
+        );
+        Predicate<QueueItem> remoteFilter = createFilter(remotesRef, item -> item.s3orLinRemote.getName().displayValue);
+        Predicate<String> nodeFilter = createFilter(nodesRef, Function.identity());
+
+        Map<String, Set<QueueItem>> queueMap = getNodeToSnapQueueMap();
+
+        for (Entry<String, Set<QueueItem>> queue : queueMap.entrySet())
+        {
+            String node = queue.getKey();
+            boolean matches = false;
+            if (!nodeFilter.test(node))
+            {
+                for (QueueItem item : queue.getValue())
+                {
+                    matches = snapFilter.test(item) || rscFilter.test(item) || remoteFilter.test(item);
+                    if (matches)
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                matches = true;
+            }
+            List<BackupSnapQueuesPojo> items = createQueueItemPojoList(queue.getValue(), matches);
+            if (!items.isEmpty())
+            {
+                ret.add(new BackupNodeQueuesPojo(node, items));
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * Compiles a map of node names (as Strings) to a set of QueueItems from two sources:
+     * backupInfoMgr.getNodeToSnapQueues() and backupInfoMgr.getPrevNodeUndecidedQueue().
+     * The QueueItems from the latter are added with ApiConsts.VAL_NODE_UNDECIDED set as their node name.
+     */
+    private Map<String, Set<QueueItem>> getNodeToSnapQueueMap()
+    {
+        Map<String, Set<QueueItem>> queueMap = new HashMap<>();
+        for (Entry<Node, Set<QueueItem>> queue : backupInfoMgr.getNodeToSnapQueues())
+        {
+            queueMap.put(queue.getKey().getName().displayValue, queue.getValue());
+        }
+        // for queueItems where it is still unknown on which nodes they can be shipped
+        queueMap.put(ApiConsts.VAL_NODE_UNDECIDED, backupInfoMgr.getPrevNodeUndecidedQueue());
+        return queueMap;
+    }
+
+    private List<BackupSnapQueuesPojo> createQueueItemPojoList(Set<QueueItem> queueItems, boolean matches)
+    {
+        List<BackupSnapQueuesPojo> items = new ArrayList<>();
+        if (matches)
+        {
+            for (QueueItem item : queueItems)
+            {
+                items.add(queueItemToPojo(item, null));
+            }
+        }
+        return items;
+    }
+
+    private BackupSnapQueuesPojo queueItemToPojo(QueueItem item, @Nullable List<BackupNodeQueuesPojo> nodes)
+    {
+        @Nullable String startTimeStr = item.snapDfn.getSnapDfnProps()
+            .getProp(
+                InternalApiConsts.KEY_BACKUP_START_TIMESTAMP,
+                BackupShippingUtils.BACKUP_SOURCE_PROPS_NAMESPC + "/" + item.s3orLinRemote.getName().displayValue
+            );
+        @Nullable final SnapshotDefinition prevSnapDfn = item.prevSnapDfn;
+        boolean inc = false;
+        @Nullable String basedOn = null;
+        if (prevSnapDfn != null)
+        {
+            inc = true;
+            basedOn = prevSnapDfn.getName().displayValue;
+        }
+        return new BackupSnapQueuesPojo(
+            item.snapDfn.getResourceName().displayValue,
+            item.snapDfn.getName().displayValue,
+            item.s3orLinRemote.getName().displayValue,
+            inc,
+            basedOn,
+            (startTimeStr == null || startTimeStr.isEmpty()) ? null : Long.parseLong(startTimeStr),
+            item.preferredNode,
+            nodes
+        );
+    }
+
+    private <T> Predicate<T> createFilter(List<String> list, Function<T, String> mapper)
+    {
+        Predicate<T> ret;
+        if (list != null && !list.isEmpty())
+        {
+            Set<String> lowerList = new HashSet<>();
+            for (String item : list)
+            {
+                lowerList.add(item.toLowerCase());
+            }
+            ret = item -> lowerList.contains(mapper.apply(item).toLowerCase());
+        }
+        else
+        {
+            ret = ignored -> true;
+        }
+        return ret;
+    }
+
+    public static class IteratorFromBackupNodeQueue
+        implements Iterator<QueueItem>
+    {
+        private Node node;
+        private final BackupInfoManager backupInfoMgr;
+
+        public IteratorFromBackupNodeQueue(Node nodeRef, BackupInfoManager backupInfoMgrRef)
+        {
+            node = nodeRef;
+            backupInfoMgr = backupInfoMgrRef;
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            return backupInfoMgr.getNextFromQueue(node, false) != null;
+        }
+
+        @Override
+        public @Nullable QueueItem next()
+        {
+            return backupInfoMgr.getNextFromQueue(node, true);
+        }
+    }
+
+    private class IteratorFromSingleItem implements Iterator<QueueItem>
+    {
+        private @Nullable QueueItem item;
+
+        IteratorFromSingleItem(@Nullable QueueItem itemRef)
+        {
+            item = itemRef;
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            return item != null;
+        }
+
+        @Override
+        public @Nullable QueueItem next()
+        {
+            @Nullable QueueItem ret = item;
+            if (ret != null)
+            {
+                backupInfoMgr.deleteFromQueue(ret.snapDfn, ret.s3orLinRemote);
+                item = null;
+            }
+            return ret;
+        }
+    }
+}

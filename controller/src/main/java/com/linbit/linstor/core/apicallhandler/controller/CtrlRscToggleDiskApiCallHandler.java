@@ -1,0 +1,1767 @@
+package com.linbit.linstor.core.apicallhandler.controller;
+
+import com.linbit.ImplementationError;
+import com.linbit.linstor.CtrlStorPoolResolveHelper;
+import com.linbit.linstor.LinstorParsingUtils;
+import com.linbit.linstor.annotation.Nullable;
+import com.linbit.linstor.api.ApiCallRc;
+import com.linbit.linstor.api.ApiCallRcImpl;
+import com.linbit.linstor.api.ApiConsts;
+import com.linbit.linstor.core.BackgroundRunner;
+import com.linbit.linstor.core.LinStor;
+import com.linbit.linstor.core.apicallhandler.ScopeRunner;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.AutoHelperContext;
+import com.linbit.linstor.core.apicallhandler.controller.autohelper.CtrlRscAutoHelper;
+import com.linbit.linstor.core.apicallhandler.controller.helpers.CopySnapsHelper;
+import com.linbit.linstor.core.apicallhandler.controller.internal.CtrlSatelliteUpdateCaller;
+import com.linbit.linstor.core.apicallhandler.response.ApiDatabaseException;
+import com.linbit.linstor.core.apicallhandler.response.ApiOperation;
+import com.linbit.linstor.core.apicallhandler.response.ApiRcException;
+import com.linbit.linstor.core.apicallhandler.response.CtrlResponseUtils;
+import com.linbit.linstor.core.apicallhandler.response.ResponseContext;
+import com.linbit.linstor.core.apicallhandler.response.ResponseConverter;
+import com.linbit.linstor.core.apicallhandler.response.ResponseUtils;
+import com.linbit.linstor.core.identifier.NodeName;
+import com.linbit.linstor.core.identifier.ResourceName;
+import com.linbit.linstor.core.identifier.SharedStorPoolName;
+import com.linbit.linstor.core.objects.Node;
+import com.linbit.linstor.core.objects.Resource;
+import com.linbit.linstor.core.objects.Resource.DiskfulBy;
+import com.linbit.linstor.core.objects.Resource.Flags;
+import com.linbit.linstor.core.objects.ResourceDefinition;
+import com.linbit.linstor.core.objects.StorPool;
+import com.linbit.linstor.core.objects.Volume;
+import com.linbit.linstor.core.objects.VolumeDefinition;
+import com.linbit.linstor.core.objects.utils.MixedStorPoolHelper;
+import com.linbit.linstor.core.types.TcpPortNumber;
+import com.linbit.linstor.dbdrivers.DatabaseException;
+import com.linbit.linstor.event.EventWaiter;
+import com.linbit.linstor.event.ObjectIdentifier;
+import com.linbit.linstor.event.common.ResourceState;
+import com.linbit.linstor.event.common.ResourceStateEvent;
+import com.linbit.linstor.layer.LayerPayload;
+import com.linbit.linstor.layer.resource.CtrlRscLayerDataFactory;
+import com.linbit.linstor.logging.ErrorReporter;
+import com.linbit.linstor.netcom.PeerNotConnectedException;
+import com.linbit.linstor.propscon.InvalidKeyException;
+import com.linbit.linstor.propscon.InvalidValueException;
+import com.linbit.linstor.propscon.Props;
+import com.linbit.linstor.propscon.ReadOnlyProps;
+import com.linbit.linstor.stateflags.StateFlags;
+import com.linbit.linstor.storage.StorageException;
+import com.linbit.linstor.storage.data.adapter.drbd.DrbdRscData;
+import com.linbit.linstor.storage.interfaces.categories.resource.AbsRscLayerObject;
+import com.linbit.linstor.storage.interfaces.layers.drbd.DrbdRscObject.DrbdRscFlags;
+import com.linbit.linstor.storage.kinds.DeviceLayerKind;
+import com.linbit.linstor.storage.utils.LayerUtils;
+import com.linbit.linstor.tasks.AutoDiskfulTask;
+import com.linbit.linstor.utils.layer.DrbdLayerUtils;
+import com.linbit.linstor.utils.layer.LayerRscUtils;
+import com.linbit.linstor.utils.layer.LayerVlmUtils;
+import com.linbit.locks.LockGuard;
+import com.linbit.locks.LockGuardFactory;
+import com.linbit.locks.LockGuardFactory.LockObj;
+import com.linbit.locks.LockGuardFactory.LockType;
+import com.linbit.utils.StringUtils;
+
+import static com.linbit.linstor.core.apicallhandler.controller.CtrlRscApiCallHandler.makeRscContext;
+
+import jakarta.inject.Inject;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeSet;
+
+import org.reactivestreams.Publisher;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.util.function.Tuple2;
+
+/**
+ * Adds disks to a diskless resource or removes disks to make a resource diskless.
+ * <p>
+ * When adding disks to a diskless resource, the states defined by the following flags are used:
+ * <ol>
+ *     <li>DISKLESS, DISK_ADD_REQUESTED - the transition has been requested but not yet started</li>
+ *     <li>DISKLESS, DISK_ADD_REQUESTED, DISK_ADDING - the peers should prepare for the resource to gain disks</li>
+ *     <li>none - the disks should be added</li>
+ * </ol>
+ * <p>
+ * When removing disks to make a resource diskless, the states defined by the following flags are used:
+ * <ol>
+ *     <li>DISK_REMOVE_REQUESTED - the transition has been requested but not yet started</li>
+ *     <li>DISKLESS, DISK_REMOVE_REQUESTED, DISK_REMOVING - the disks should be removed</li>
+ *     <li>DISKLESS - the peers should acknowledge the removal of the disks</li>
+ * </ol>
+ */
+@Singleton
+public class CtrlRscToggleDiskApiCallHandler implements CtrlSatelliteConnectionListener
+{
+    public enum ToggleOp
+    {
+        INTO_DRBD_DISKFUL(false),
+        INTO_DRBD_DISKLESS(true),
+        INTO_DRBD_CLIENT(true),
+        INTO_DRBD_TIEBREAKER(true);
+
+        private final boolean removeDisk;
+
+        ToggleOp(boolean removeDiskRef)
+        {
+            removeDisk = removeDiskRef;
+        }
+
+        public static ToggleOp parse(@Nullable String str)
+        {
+            if (str == null)
+            {
+                throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(ApiConsts.API_CALL_PARSE_ERROR, "No toggle operation type was specified")
+                );
+            }
+            return switch (str.toLowerCase())
+            {
+                case "into_drbd_diskful" -> INTO_DRBD_DISKFUL;
+                case "into_drbd_diskless" -> INTO_DRBD_DISKLESS;
+                case "into_drbd_client" -> INTO_DRBD_CLIENT;
+                // "into tiebreaker" is not (yet) exposed via API. This will be part of a different MR
+                // case "into_drbd_tiebreaker" -> INTO_DRBD_TIEBREAKER;
+                default -> throw new ApiRcException(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.API_CALL_PARSE_ERROR,
+                        "Could not parse '" + str + "'." +
+                            " Valid operations: " + StringUtils.join(
+                                ", ",
+                                // skipping tiebreaker here since it is not exposed towards the user (yet)
+                                // otherwise we could replace this list with ToggleOp.values()
+                                INTO_DRBD_DISKFUL,
+                                INTO_DRBD_CLIENT,
+                                INTO_DRBD_DISKLESS
+                            )
+                    )
+                );
+            };
+        }
+    }
+
+    private final ScopeRunner scopeRunner;
+    private final BackgroundRunner backgroundRunner;
+    private final CtrlApiDataLoader ctrlApiDataLoader;
+    private final CtrlTransactionHelper ctrlTransactionHelper;
+    private final CtrlPropsHelper ctrlPropsHelper;
+    private final CtrlVlmCrtApiHelper ctrlVlmCrtApiHelper;
+    private final CtrlStorPoolResolveHelper ctrlStorPoolResolveHelper;
+    private final CtrlRscDeleteApiHelper ctrlRscDeleteApiHelper;
+    private final CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCaller;
+    private final CtrlRscLayerDataFactory ctrlLayerStackHelper;
+    private final ResponseConverter responseConverter;
+    private final ResourceStateEvent resourceStateEvent;
+    private final EventWaiter eventWaiter;
+    private final LockGuardFactory lockGuardFactory;
+    private final Provider<CtrlRscAutoHelper> rscAutoHelper;
+    private final ErrorReporter errorReporter;
+    private final CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandler;
+    private final Provider<CtrlRscDfnApiCallHandler> ctrlRscDfnApiCallHandler;
+    private final Provider<AutoDiskfulTask> autoDiskfulTaskProvider;
+    private final MixedStorPoolHelper mixedStorPoolHelper;
+    private final CopySnapsHelper copySnapHelper;
+    private final FreeCapacityFetcher freeCapacityFetcher;
+    private final CtrlRscApiCallHandler ctrlRscApiCallHandler;
+
+    @Inject
+    public CtrlRscToggleDiskApiCallHandler(
+        ScopeRunner scopeRunnerRef,
+        BackgroundRunner backgroundRunnerRef, CtrlApiDataLoader ctrlApiDataLoaderRef,
+        CtrlTransactionHelper ctrlTransactionHelperRef,
+        CtrlPropsHelper ctrlPropsHelperRef,
+        CtrlVlmCrtApiHelper ctrlVlmCrtApiHelperRef,
+        CtrlStorPoolResolveHelper ctrlStorPoolResolveHelperRef,
+        CtrlRscDeleteApiHelper ctrlRscDeleteApiHelperRef,
+        CtrlSatelliteUpdateCaller ctrlSatelliteUpdateCallerRef,
+        CtrlRscLayerDataFactory ctrlLayerStackHelperRef,
+        ResponseConverter responseConverterRef,
+        ResourceStateEvent resourceStateEventRef,
+        EventWaiter eventWaiterRef,
+        LockGuardFactory lockGuardFactoryRef,
+        Provider<CtrlRscAutoHelper> rscAutoHelperRef,
+        ErrorReporter errorReporterRef,
+        CtrlRscActivateApiCallHandler ctrlRscActivateApiCallHandlerRef,
+        Provider<CtrlRscDfnApiCallHandler> ctrlRscDfnApiCallHandlerRef,
+        Provider<AutoDiskfulTask> autoDiskfulTaskProviderRef,
+        MixedStorPoolHelper mixedStorPoolHelperRef,
+        CopySnapsHelper copySnapHelperRef,
+        FreeCapacityFetcher freeCapacityFetcherRef,
+        CtrlRscApiCallHandler ctrlRscApiCallHandlerRef
+    )
+    {
+        scopeRunner = scopeRunnerRef;
+        backgroundRunner = backgroundRunnerRef;
+        ctrlApiDataLoader = ctrlApiDataLoaderRef;
+        ctrlTransactionHelper = ctrlTransactionHelperRef;
+        ctrlPropsHelper = ctrlPropsHelperRef;
+        ctrlVlmCrtApiHelper = ctrlVlmCrtApiHelperRef;
+        ctrlStorPoolResolveHelper = ctrlStorPoolResolveHelperRef;
+        ctrlRscDeleteApiHelper = ctrlRscDeleteApiHelperRef;
+        ctrlSatelliteUpdateCaller = ctrlSatelliteUpdateCallerRef;
+        ctrlLayerStackHelper = ctrlLayerStackHelperRef;
+        responseConverter = responseConverterRef;
+        resourceStateEvent = resourceStateEventRef;
+        eventWaiter = eventWaiterRef;
+        lockGuardFactory = lockGuardFactoryRef;
+        rscAutoHelper = rscAutoHelperRef;
+        errorReporter = errorReporterRef;
+        ctrlRscActivateApiCallHandler = ctrlRscActivateApiCallHandlerRef;
+        ctrlRscDfnApiCallHandler = ctrlRscDfnApiCallHandlerRef;
+        autoDiskfulTaskProvider = autoDiskfulTaskProviderRef;
+        mixedStorPoolHelper = mixedStorPoolHelperRef;
+        copySnapHelper = copySnapHelperRef;
+        freeCapacityFetcher = freeCapacityFetcherRef;
+        ctrlRscApiCallHandler = ctrlRscApiCallHandlerRef;
+    }
+
+    @Override
+    public Collection<Flux<ApiCallRc>> resourceDefinitionConnected(ResourceDefinition rscDfn, ResponseContext context)
+    {
+        List<Flux<ApiCallRc>> fluxes = new ArrayList<>();
+
+        ResourceName rscName = rscDfn.getName();
+
+        Iterator<Resource> rscIter = rscDfn.iterateResource();
+        while (rscIter.hasNext())
+        {
+            Resource rsc = rscIter.next();
+            @Nullable ToggleOp toggleOp = getToggleOperation(rsc);
+            if (toggleOp != null)
+            {
+                NodeName nodeName = rsc.getNode().getName();
+                fluxes.add(updateAndAdjustDisk(nodeName, rscName, toggleOp, context));
+            }
+        }
+
+        return fluxes;
+    }
+
+    /**
+     * Returns the {@link ToggleOp} the given resource is in, if any.
+     */
+    private @Nullable ToggleOp getToggleOperation(Resource rsc)
+    {
+        @Nullable ToggleOp toggleOp = null; // resource not in toggle-disk state
+        StateFlags<Flags> rscFlags = rsc.getStateFlags();
+        if (rscFlags.isSet(Resource.Flags.DISK_ADD_REQUESTED))
+        {
+            toggleOp = ToggleOp.INTO_DRBD_DISKFUL;
+        }
+        else if (rscFlags.isSet(Resource.Flags.DISK_REMOVE_REQUESTED))
+        {
+            if (rscFlags.isSet(Resource.Flags.TIE_BREAKER))
+            {
+                toggleOp = ToggleOp.INTO_DRBD_TIEBREAKER;
+            }
+            else
+            {
+                Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+                    rsc.getLayerData(),
+                    DeviceLayerKind.DRBD
+                );
+                for (AbsRscLayerObject<Resource> drbdRscObj : drbdRscDataSet)
+                {
+                    DrbdRscData<Resource> drbdRscData = (DrbdRscData<Resource>) drbdRscObj;
+                    if (drbdRscData.getFlags().isSet(DrbdRscFlags.CLIENT))
+                    {
+                        toggleOp = ToggleOp.INTO_DRBD_CLIENT;
+                        break;
+                    }
+                }
+                if (toggleOp == null)
+                {
+                    toggleOp = ToggleOp.INTO_DRBD_DISKLESS;
+                }
+            }
+        }
+        return toggleOp;
+    }
+
+    @Override
+    public Collection<Flux<ApiCallRc>> resourceConnected(Resource rsc)
+    {
+        ResponseContext context = makeRscContext(
+            ApiOperation.makeModifyOperation(),
+            rsc.getNode().getName().displayValue,
+            rsc.getResourceDefinition().getName().displayValue
+        );
+        String migrateFromNodeNameStr = getPropsPrivileged(rsc).map().get(ApiConsts.KEY_RSC_MIGRATE_FROM);
+
+        // Only restart the migration watch if adding the disk is complete
+        boolean diskAddRequested = rsc.getStateFlags().isSet(Resource.Flags.DISK_ADD_REQUESTED);
+
+        return migrateFromNodeNameStr == null || !diskAddRequested ?
+            Collections.emptySet() :
+            Collections.singleton(Flux.from(waitForMigration(
+                context,
+                rsc.getNode().getName(),
+                rsc.getResourceDefinition().getName(),
+                ctrlApiDataLoader.loadNode(migrateFromNodeNameStr).getName()
+            )));
+    }
+
+    public Flux<ApiCallRc> resourceToggleDisk(
+        String nodeNameStr,
+        String rscNameStr,
+        @Nullable String storPoolNameStr,
+        @Nullable String migrateFromNodeNameStr,
+        @Nullable List<String> layerListRef,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        @Nullable Resource.DiskfulBy diskfulByRef
+    )
+    {
+        return freeCapacityFetcher.fetchThinFreeCapacities(
+            Collections.singleton(LinstorParsingUtils.asNodeName(nodeNameStr))
+        )
+            .flatMapMany(
+                thinFreeCapacities -> resourceToggleDisk(
+                    nodeNameStr,
+                    rscNameStr,
+                    storPoolNameStr,
+                    migrateFromNodeNameStr,
+                    layerListRef,
+                    toggleOpRef,
+                    diskfulByRef,
+                    false,
+                    Collections.emptyList(),
+                    false,
+                    thinFreeCapacities
+                )
+            );
+    }
+
+    public Flux<ApiCallRc> resourceToggleDisk(
+        String nodeNameStr,
+        String rscNameStr,
+        @Nullable String storPoolNameStr,
+        @Nullable String migrateFromNodeNameStr,
+        @Nullable List<String> layerListRef,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        @Nullable Resource.DiskfulBy diskfulByRef,
+        boolean copyAllSnapsRef,
+        List<String> snapNamesToCopyRef,
+        boolean copySnapsForEvac,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacitiesRef
+    )
+    {
+        ResponseContext context = makeRscContext(
+            ApiOperation.makeModifyOperation(),
+            nodeNameStr,
+            rscNameStr
+        );
+
+        Mono<@Nullable Map<StorPool.Key, Long>> thinFreeCapacitiesMono;
+
+        if (!toggleOpRef.removeDisk && thinFreeCapacitiesRef == null)
+        {
+            thinFreeCapacitiesMono = freeCapacityFetcher
+                .fetchThinFreeCapacities(Collections.singleton(LinstorParsingUtils.asNodeName(nodeNameStr)));
+        }
+        else
+        {
+            thinFreeCapacitiesMono = Mono.just(thinFreeCapacitiesRef);
+        }
+
+        return thinFreeCapacitiesMono.flatMapMany(
+            thinFreeCapacities -> scopeRunner
+                .fluxInTransactionalScope(
+                    "Toggle disk",
+                    createLockGuard(),
+                    () -> toggleDiskInTransaction(
+                        nodeNameStr,
+                        rscNameStr,
+                        storPoolNameStr,
+                        migrateFromNodeNameStr,
+                        layerListRef,
+                        toggleOpRef,
+                        diskfulByRef,
+                        copyAllSnapsRef,
+                        snapNamesToCopyRef,
+                        context,
+                        copySnapsForEvac,
+                        thinFreeCapacities
+                    )
+                )
+                .transform(responses -> responseConverter.reportingExceptions(context, responses))
+        );
+    }
+
+    /**
+     * Determines what action to take for a toggle disk request.
+     */
+    private enum ToggleDiskAction
+    {
+        /** Resource is already in the desired state, no action needed */
+        NOOP,
+        /** Normal toggle disk operation */
+        NORMAL,
+        /** Abort current transition and start opposite direction */
+        ABORT,
+        /** Retry current transition (re-update satellites) */
+        RETRY
+    }
+
+    /**
+     * Result of resolving and validating storage pools for toggle disk operation.
+     */
+    private static class StorPoolResolutionResult
+    {
+        final boolean needsDeactivate;
+        final LayerPayload payload;
+
+        StorPoolResolutionResult(
+            boolean needsDeactivateRef,
+            LayerPayload payloadRef
+        )
+        {
+            needsDeactivate = needsDeactivateRef;
+            payload = payloadRef;
+        }
+    }
+
+    private Flux<ApiCallRc> toggleDiskInTransaction(
+        String nodeNameStr,
+        String rscNameStr,
+        @Nullable String storPoolNameStr,
+        @Nullable String migrateFromNodeNameStr,
+        @Nullable List<String> layerListStr,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        @Nullable Resource.DiskfulBy diskfulByRef,
+        boolean copyAllSnapsRef,
+        List<String> snapNamesToCopyRef,
+        ResponseContext context,
+        boolean copySnapsForEvac,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities
+    )
+    {
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+        NodeName nodeName = LinstorParsingUtils.asNodeName(nodeNameStr);
+        ResourceName rscName = LinstorParsingUtils.asRscName(rscNameStr);
+
+        errorReporter.logInfo("Toggle Disk on %s/%s %s", nodeNameStr, rscNameStr, toggleOpRef);
+
+        Resource rsc = ctrlApiDataLoader.loadRsc(nodeName, rscName);
+        ResourceDefinition rscDfn = rsc.getResourceDefinition();
+
+        // 1. Determine what action to take
+        ToggleDiskAction action = determineToggleDiskAction(rsc, toggleOpRef);
+
+        errorReporter.logDebug("Toggle Disk action: %s", action);
+
+        Flux<ApiCallRc> retFlux;
+        // 2. Handle based on action type
+        switch (action)
+        {
+            case NOOP:
+                retFlux = handleNoopAction(rsc, toggleOpRef);
+                break;
+            case RETRY:
+                retFlux = handleRetryAction(rsc, toggleOpRef, context);
+                break;
+            case ABORT:
+                clearToggleDiskFlags(rsc);
+                errorReporter.logInfo(
+                    "Aborting previous toggle disk transition, starting new transition to %s",
+                    toggleOpRef.toString()
+                );
+                // fall-through to NORMAL case
+            case NORMAL:
+                retFlux = handleNormalToggleDisk(
+                    rsc,
+                    rscDfn,
+                    nodeName,
+                    rscName,
+                    storPoolNameStr,
+                    migrateFromNodeNameStr,
+                    layerListStr,
+                    toggleOpRef,
+                    diskfulByRef,
+                    copyAllSnapsRef,
+                    snapNamesToCopyRef,
+                    context,
+                    copySnapsForEvac,
+                    thinFreeCapacities,
+                    responses
+                );
+                break;
+            default:
+                throw new ImplementationError("Unhandled case: " + action);
+        }
+        return retFlux;
+    }
+
+    /**
+     * <p>No toggle-disk operation is executed by this method. The resource is already in the expected diskful/diskless
+     * state</p>
+     * <p>However, for convenience we still check if tiebreaker/client/diskless options might have changed and if
+     * so we delegate this Flux call as if would be a "resource modify ..." call with the appropriate options.
+     */
+    private Flux<ApiCallRc> handleNoopAction(Resource rscRef, CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef)
+    {
+        Flux<ApiCallRc> ret;
+        if (!toggleOpRef.removeDisk)
+        {
+            // we are diskful. tiebreaker/drbdClient are ignored
+            ApiCallRcImpl responses = new ApiCallRcImpl();
+            responses.addEntry(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.INFO_NOOP,
+                    "Resource '" + rscRef.getResourceDefinition().getName().displayValue + "' on node '" +
+                        rscRef.getNode().getName().displayValue + "' is already diskful"
+                )
+            );
+            ret = Flux.just(responses);
+        }
+        else
+        {
+            boolean isClient;
+            boolean isTiebreaker;
+            isClient = DrbdLayerUtils.isDrbdClient(rscRef);
+            isTiebreaker = DrbdLayerUtils.isTiebreaker(rscRef);
+
+            boolean disklessTypeChange = switch (toggleOpRef)
+            {
+                case INTO_DRBD_CLIENT -> !isClient;
+                case INTO_DRBD_TIEBREAKER -> !isTiebreaker;
+                case INTO_DRBD_DISKLESS -> isClient || isTiebreaker;
+                case INTO_DRBD_DISKFUL -> false;
+            };
+            if (disklessTypeChange)
+            {
+                ret = ctrlRscApiCallHandler.modify(
+                    rscRef.getUuid(),
+                    rscRef.getNode().getName().displayValue,
+                    rscRef.getResourceDefinition().getName().displayValue,
+                    Collections.emptyMap(),
+                    Collections.emptySet(),
+                    Collections.emptySet(),
+                    toggleOpRef == ToggleOp.INTO_DRBD_TIEBREAKER,
+                    toggleOpRef == ToggleOp.INTO_DRBD_CLIENT
+                );
+            }
+            else
+            {
+                ApiCallRcImpl responses = new ApiCallRcImpl();
+                String state;
+                if (toggleOpRef == ToggleOp.INTO_DRBD_TIEBREAKER)
+                {
+                    state = "a tiebreaker";
+                }
+                else if (toggleOpRef == ToggleOp.INTO_DRBD_CLIENT)
+                {
+                    state = "a diskless client";
+                }
+                else
+                {
+                    state = "diskless";
+                }
+                responses.addEntry(
+                    ApiCallRcImpl.simpleEntry(
+                        ApiConsts.INFO_NOOP,
+                        "Resource '" + rscRef.getResourceDefinition().getName().displayValue + "' on node '" +
+                            rscRef.getNode().getName().displayValue + "' is already " + state
+                    )
+                );
+                ret = Flux.just(responses);
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * Retries a toggle disk. Besides a message to the client this method does not change any flags or properties
+     * but just continues the Flux starting with
+     * {@link CtrlRscToggleDiskApiCallHandler#updateAndAdjustDisk(NodeName, ResourceName, ToggleOp, ResponseContext)}.
+     */
+    private Flux<ApiCallRc> handleRetryAction(
+        Resource rscRef,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        ResponseContext context
+    )
+    {
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+        NodeName nodeName = rscRef.getNode().getName();
+        ResourceName rscName = rscRef.getResourceDefinition().getName();
+        responses.addEntry(ApiCallRcImpl.simpleEntry(
+            ApiConsts.INFO_NOOP,
+            "Retrying toggle disk " + toggleOpRef + " for resource '" + rscName.displayValue +
+                "' on node '" + nodeName.displayValue + "'"
+        ));
+
+        return Flux
+            .<ApiCallRc>just(responses)
+            .concatWith(updateAndAdjustDisk(nodeName, rscName, toggleOpRef, context));
+    }
+
+    /**
+     * Default behavior. Handles diskful -> diskless or vice versa scenarios.
+     */
+    private Flux<ApiCallRc> handleNormalToggleDisk(
+        Resource rsc,
+        ResourceDefinition rscDfn,
+        NodeName nodeName,
+        ResourceName rscName,
+        @Nullable String storPoolNameStr,
+        @Nullable String migrateFromNodeNameStr,
+        @Nullable List<String> layerListStr,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        @Nullable Resource.DiskfulBy diskfulByRef,
+        boolean copyAllSnapsRef,
+        List<String> snapNamesToCopyRef,
+        ResponseContext context,
+        boolean copySnapsForEvac,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities,
+        ApiCallRcImpl responses
+    )
+    {
+        // 1. Validate preconditions
+        validateToggleDiskPreconditions(rsc, toggleOpRef);
+
+        // 2. Resolve and validate storage pools
+        StorPoolResolutionResult storPoolResult = resolveStoragePools(
+            rsc,
+            toggleOpRef.removeDisk,
+            thinFreeCapacities,
+            storPoolNameStr,
+            responses
+        );
+
+        // 3. Handle disk removal or addition
+        Flux<ApiCallRc> deactivateFlux;
+        if (toggleOpRef.removeDisk)
+        {
+            // diskful -> diskless
+            markDiskRemoveRequested(rsc);
+            removeDiskfulByProp(rsc);
+            deactivateFlux = Flux.empty();
+        }
+        else
+        {
+            // diskless -> diskful
+            deactivateFlux = prepareDiskAddition(
+                rsc,
+                migrateFromNodeNameStr,
+                layerListStr,
+                diskfulByRef,
+                storPoolResult,
+                responses
+            );
+        }
+
+        // 4. validate layer support. This needs to be done after the layerData was possibly recreated.
+        // Therefore, DO NOT move this method into the early fail fast!
+        validateLayerSupport(rsc);
+
+        // 5. Commit and build response
+        ctrlTransactionHelper.commit();
+
+        String actionStr = toggleOpRef.removeDisk ? "Removal of disk from" : "Addition of disk to";
+        responses.addEntry(ApiCallRcImpl.simpleEntry(
+            ApiConsts.MODIFIED,
+            actionStr + " resource '" + rscDfn.getName().displayValue + "' " +
+                "on node '" + rsc.getNode().getName().displayValue + "' registered"
+        ));
+
+        return Flux
+            .<ApiCallRc>just(responses)
+            .concatWith(deactivateFlux)
+            .concatWith(updateAndAdjustDisk(nodeName, rscName, toggleOpRef, context))
+            .concatWith(ctrlRscDfnApiCallHandler.get().updateProps(rscDfn))
+            .concatWith(
+                copySnapHelper.getCopyFlux(
+                    Collections.singleton(rsc),
+                    copyAllSnapsRef,
+                    snapNamesToCopyRef,
+                    context,
+                    copySnapsForEvac
+                )
+            );
+    }
+
+    /**
+     * Determines what action to take for a toggle disk request based on current state.
+     *
+     * @param rsc the resource
+     * @param toggleOpRef The toggle operation that should be performed
+     *
+     * @return the action to take
+     */
+    private ToggleDiskAction determineToggleDiskAction(
+        Resource rsc,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef
+    )
+    {
+        boolean removeDisk = toggleOpRef.removeDisk;
+        /*
+         * DRBD_DISKLESS flag behavior:
+         * diskful -> diskless:
+         * * A0) pre-toggle-disk-state: - (same state as B3)
+         * * A1) toggleDiskInTx: DISK_REMOVE_REQUESTED
+         * * A2) updateAndAdjustDisk: DISK_REMOVE_REQUESTED, DISK_REMOVING, DRBD_DISKLESS
+         * * A3) finishOperation: DRBD_DISKLESS (same state as B0)
+         *
+         * diskless -> diskful:
+         * * B0) pre-toggle-disk-state: DRBD_DISKLESS (same state as A3)
+         * * B1) toggleDiskInTx: DISK_ADD_REQUESTED, DRBD_DISKLESS
+         * * B2) updateAndAdjustdisk: DISK_ADD_REQUESTED, DISK_ADDING, DRBD_DISKLESS
+         * * B3) finishOperation: - (same state as A0)
+         */
+        boolean isDiskless = ctrlVlmCrtApiHelper.isDiskless(rsc);
+        boolean diskAddRequested = hasDiskAddRequested(rsc);
+        boolean diskRemoveRequested = hasDiskRemoveRequested(rsc);
+
+        ToggleDiskAction action;
+        if (isDiskless)
+        { // candidates: A2, A3/B0, B1, B2
+            if (diskAddRequested)
+            { // B1 or B2
+                action = removeDisk ? ToggleDiskAction.ABORT : ToggleDiskAction.RETRY;
+            }
+            else if (diskRemoveRequested)
+            { // A2
+                action = removeDisk ? ToggleDiskAction.RETRY : ToggleDiskAction.ABORT;
+            }
+            else
+            { // A3/B0, not in toggle-disk
+                action = removeDisk ? ToggleDiskAction.NOOP : ToggleDiskAction.NORMAL;
+            }
+        }
+        else
+        { // diskful. candidates: A0/B3, A1
+            if (diskRemoveRequested)
+            { // A1
+                action = removeDisk ? ToggleDiskAction.RETRY : ToggleDiskAction.ABORT;
+            }
+            else
+            { // A0/B3, not in toggle-disk
+                action = removeDisk ? ToggleDiskAction.NORMAL : ToggleDiskAction.NOOP;
+            }
+        }
+
+        return action;
+    }
+
+    /**
+     * Validates preconditions for a normal toggle disk operation.
+     * Only called for NORMAL and ABORT actions (not for NOOP or RETRY).
+     */
+    private void validateToggleDiskPreconditions(Resource rsc, CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef)
+    {
+        ResourceDefinition rscDfn = rsc.getResourceDefinition();
+        if (toggleOpRef.removeDisk)
+        {
+            validateDiskRemovalAllowed(rsc, rscDfn);
+        }
+        else
+        {
+            ensureAllPeersHavePeerSlotLeft(rscDfn);
+        }
+    }
+
+    /**
+     * Clears all toggle-disk related flags. Used when aborting a transition.
+     */
+    private void clearToggleDiskFlags(Resource rsc)
+    {
+        try
+        {
+            rsc.getStateFlags().disableFlags(
+                Resource.Flags.DISK_ADD_REQUESTED,
+                Resource.Flags.DISK_ADDING,
+                Resource.Flags.DISK_REMOVE_REQUESTED,
+                Resource.Flags.DISK_REMOVING
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void validateDiskRemovalAllowed(Resource rsc, ResourceDefinition rscDfn)
+    {
+        int haveDiskCount = countDisksAndIsOnline(rscDfn);
+        if (haveDiskCount <= 1)
+        {
+            throw new ApiRcException(ApiCallRcImpl.simpleEntry(
+                ApiConsts.FAIL_INSUFFICIENT_REPLICA_COUNT,
+                "Cannot remove the disk from the only online resource with a disk",
+                true
+            ));
+        }
+
+        if (!LayerUtils.hasLayer(getLayerData(rsc), DeviceLayerKind.DRBD))
+        {
+            throw new ApiRcException(ApiCallRcImpl.simpleEntry(
+                ApiConsts.FAIL_INVLD_LAYER_STACK,
+                "Toggle disk is only supported in combination with DRBD",
+                true
+            ));
+        }
+    }
+
+    /**
+     * Resolves the storage pool(s) for the toggle disk so we can fail fast is something goes wrong.
+     */
+    private StorPoolResolutionResult resolveStoragePools(
+        Resource rsc,
+        boolean removeDisk,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities,
+        @Nullable String storPoolNameStrRef,
+        ApiCallRcImpl responses
+    )
+        throws ApiRcException
+    {
+        LayerPayload payload = new LayerPayload();
+        if (isSharedSourceStorPool(rsc))
+        {
+            payload.drbdRsc.needsNewNodeId = true;
+        }
+
+        updateStorPoolProp(rsc, removeDisk, storPoolNameStrRef);
+
+        boolean needsDeactivate = false;
+        Iterator<Volume> vlmIter = rsc.iterateVolumes();
+        while (vlmIter.hasNext())
+        {
+            Volume vlm = vlmIter.next();
+            VolumeDefinition vlmDfn = vlm.getVolumeDefinition();
+
+            @Nullable StorPool sp = ctrlStorPoolResolveHelper
+                .resolveStorPool(rsc, vlmDfn, removeDisk)
+                .extractApiCallRc(responses);
+
+            if (sp != null)
+            {
+                if (isSharedSpAlreadyUsed(rsc, sp))
+                {
+                    needsDeactivate = true;
+                    payload.drbdRsc.needsNewNodeId = true;
+                }
+                else if (!removeDisk)
+                {
+                    checkFreeSpace(sp, vlm, getVlmDfnSizePrivileged(vlmDfn), thinFreeCapacities);
+                }
+            }
+        }
+
+        return new StorPoolResolutionResult(needsDeactivate, payload);
+    }
+
+    /**
+     * Sets the StorPoolName property if the parameter is non-null and non-empty, otherwise deletes the property, or
+     * sets it to {@value LinStor#DISKLESS_STOR_POOL_NAME} if the resource should become diskless.
+     */
+    private void updateStorPoolProp(Resource rscRef, boolean removeDiskRef, String storPoolNameStrRef)
+        throws ImplementationError, ApiRcException, ApiDatabaseException
+    {
+        @Nullable String spNameVal = null; // null == delete prop.
+        if (storPoolNameStrRef != null && !storPoolNameStrRef.isBlank())
+        {
+            spNameVal = storPoolNameStrRef;
+        }
+        else if (removeDiskRef)
+        {
+            spNameVal = LinStor.DISKLESS_STOR_POOL_NAME;
+        }
+
+        try
+        {
+            Props rscProps = rscRef.getProps();
+            if (spNameVal != null)
+            {
+                rscProps.setProp(ApiConsts.KEY_STOR_POOL_NAME, spNameVal);
+            }
+            else
+            {
+                rscProps.removeProp(ApiConsts.KEY_STOR_POOL_NAME);
+            }
+        }
+        catch (InvalidKeyException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+        catch (InvalidValueException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_STOR_POOL_NAME,
+                    "The given storage pool name '" + storPoolNameStrRef + "' is invalid",
+                    true
+                )
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    /**
+     * <ul>
+     *  <li>Enables {@link Resource.Flags.DISK_ADD_REQUESTED}</li>
+     *  <li>Sets {@value ApiConsts#KEY_RSC_MIGRATE_FROM} if necessary</li>
+     *  <li>Recreates layer data</li>
+     *  <li>Sets {@value ApiConsts#KEY_RSC_DISKFUL_BY} if <code>diskfulByRef</code> is non-null, otherwise removes
+     *   the property</li>
+     * </ul>
+     *
+     * @return A deactivation-flux if required  (empty flux otherwise)
+     */
+    private Flux<ApiCallRc> prepareDiskAddition(
+        Resource rsc,
+        @Nullable String migrateFromNodeNameStr,
+        @Nullable List<String> layerListStr,
+        @Nullable DiskfulBy diskfulByRef,
+        StorPoolResolutionResult storPoolResult,
+        ApiCallRcImpl responses
+    )
+    {
+        Flux<ApiCallRc> deactivateFlux = Flux.empty();
+        ResourceDefinition rscDfn = rsc.getResourceDefinition();
+        LayerPayload payload = storPoolResult.payload;
+
+        markDiskAddRequested(rsc);
+
+        if (migrateFromNodeNameStr != null && !migrateFromNodeNameStr.isEmpty())
+        {
+            Resource migrateFromRsc = ctrlApiDataLoader.loadRsc(
+                migrateFromNodeNameStr,
+                rscDfn.getName().displayValue
+            );
+            setMigrateFrom(rsc, migrateFromRsc.getNode().getName());
+            ctrlRscDeleteApiHelper.ensureNotInUse(migrateFromRsc);
+        }
+
+        if (storPoolResult.needsDeactivate)
+        {
+            responses.addEntries(
+                ApiCallRcImpl.singleApiCallRc(
+                    ApiConsts.WARN_RSC_DEACTIVATED,
+                    "Resource got deactivated as target shared storage pool is already used by a shared resource"
+                )
+            );
+            deactivateFlux = ctrlRscActivateApiCallHandler.deactivateRsc(
+                rsc.getNode().getName().displayValue,
+                rscDfn.getName().displayValue
+            );
+
+            /*
+             * We also have to remove the currently diskless DrbdRscData and free up the node-id as now we must
+             * use the shared resource's node-id. We still need to preserve TCP ports though.
+             */
+            copyDrbdTcpPortsIfExists(rsc, payload);
+        }
+        else
+        {
+            copyDrbdSettings(rsc, payload);
+        }
+
+        removeLayerData(rsc);
+        List<DeviceLayerKind> layerList = CtrlRscCrtApiHelper.getLayerstackOrBuildDefault(
+            ctrlLayerStackHelper,
+            errorReporter,
+            layerListStr,
+            responses,
+            rscDfn
+        );
+
+        ctrlLayerStackHelper.ensureStackDataExists(rsc, layerList, payload);
+        setDiskfulByProp(rsc, diskfulByRef);
+
+        return deactivateFlux;
+    }
+
+    /**
+     * Checks if the given resource has some unused layers. This method must be called after the layerData was rebuild!
+     */
+    private void validateLayerSupport(Resource rsc)
+    {
+        List<DeviceLayerKind> unsupportedLayers = CtrlRscCrtApiHelper.getUnsupportedLayers(rsc);
+        if (!unsupportedLayers.isEmpty())
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_STLT_DOES_NOT_SUPPORT_LAYER,
+                    "Satellite '" + rsc.getNode().getName() + "' does not support the following layers: " +
+                        unsupportedLayers
+                )
+            );
+        }
+    }
+
+    private long getVlmDfnSizePrivileged(VolumeDefinition vlmDfnRef)
+    {
+        return vlmDfnRef.getVolumeSize();
+    }
+
+    private void checkFreeSpace(
+        StorPool spRef,
+        Volume vlmRef,
+        long requiredSizeRef,
+        @Nullable Map<StorPool.Key, Long> thinFreeCapacities
+    )
+    {
+        /*
+         * (todo copied from CtrlVlmCrtApiHelper.checkIfStorPoolsAreUsable)
+         *
+         * TODO: improve this size check. Problem is that i.e. snapshot (and backup) restore have layerData to
+         * grab meta-storage pools from.
+         * Resource create kinda has that information but no accurate sizes for the meta-devices since those are
+         * only calculated on the satellite.
+         *
+         * That is why (for now) the snapshot restore is dumbed down (in
+         * CtrlSnapshotRestoreApiCallHAndler#restoreOnNode) to only include the data-storage pool to
+         * this set of SP that will be checked here. This might fail later if a metapool runs out of space on
+         * the satellite which is also not really what one would desire.
+         */
+        if (
+            !FreeCapacityAutoPoolSelectorUtils
+                .isStorPoolUsable(
+                    requiredSizeRef,
+                    thinFreeCapacities,
+                    true,
+                    spRef.getName(),
+                    spRef.getNode(),
+                    ctrlPropsHelper.getCtrlPropsForView()
+                )
+                // allow the volume to be created if the free capacity is unknown
+                .orElse(true)
+        )
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_INVLD_VLM_SIZE,
+                    String.format(
+                        "Not enough free space available for volume %d of resource '%s'.",
+                        vlmRef.getVolumeDefinition().getVolumeNumber().value,
+                        vlmRef.getResourceDefinition().getName().getDisplayName()
+                    ),
+                    true
+                )
+            );
+        }
+    }
+
+    private void ensureAllPeersHavePeerSlotLeft(ResourceDefinition rscDfnRef)
+    {
+        List<Resource> diskfulRscList = rscDfnRef.getDiskfulResources();
+
+        /*
+         * usually we need one peer slot less than we have diskful resources, but we are about to toggle disk a
+         * resource so the "new" diskful resource count will be +1. Therefore the -1 and +1 eliminate each other.
+         */
+        int requiredPeerSlots = diskfulRscList.size();
+
+        LinkedHashMap<Resource, Short> rscListWithInsufficientPeerSlots = new LinkedHashMap<>();
+        for (Resource rsc : diskfulRscList)
+        {
+            Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+                getLayerData(rsc),
+                DeviceLayerKind.DRBD
+            );
+            if (drbdRscDataSet.size() >= 2)
+            {
+                throw new ImplementationError("Unexpected layer tree");
+            }
+            if (!drbdRscDataSet.isEmpty())
+            {
+                DrbdRscData<Resource> drbdRscData = (DrbdRscData<Resource>) drbdRscDataSet.iterator().next();
+                if (drbdRscData.getPeerSlots() < requiredPeerSlots)
+                {
+                    rscListWithInsufficientPeerSlots.put(rsc, drbdRscData.getPeerSlots());
+                }
+            }
+        }
+        if (!rscListWithInsufficientPeerSlots.isEmpty())
+        {
+            StringBuilder detailsBuilder = new StringBuilder("Resources with insufficient peer slots (")
+                .append(requiredPeerSlots)
+                .append(" required): \n");
+            for (Entry<Resource, Short> entry : rscListWithInsufficientPeerSlots.entrySet())
+            {
+                detailsBuilder.append(" * ")
+                    .append(entry.getKey().toString())
+                    .append(" has peer slots: ")
+                    .append(entry.getValue())
+                    .append("\n");
+            }
+            detailsBuilder.setLength(detailsBuilder.length() - 1);
+
+            throw new ApiRcException(
+                ApiCallRcImpl.entryBuilder(
+                    ApiConsts.FAIL_INSUFFICIENT_PEER_SLOTS,
+                    "Existing resources do not have enough peer slots"
+                )
+                    .setDetails(detailsBuilder.toString())
+                    .setAppendObjectDescriptionToDetails(false)
+                    .build()
+            );
+        }
+    }
+
+    /**
+     * Copies DRBD settings (node-id and TCP ports) from the existing DrbdRscData into the payload
+     * before removeLayerData() deletes them. This ensures that recreated DrbdRscData ends up with
+     * the same node-id and TCP ports as before.
+     *
+     * TCP ports must be preserved because if the satellite misses the update (e.g. due to controller
+     * restart or connectivity issues), it will keep the old ports while peers receive the new ones,
+     * causing DRBD connections to fail with StandAlone state.
+     */
+    private void copyDrbdSettings(Resource rsc, LayerPayload payload) throws ImplementationError
+    {
+        copyDrbdNodeIdIfExists(rsc, payload);
+        copyDrbdTcpPortsIfExists(rsc, payload);
+    }
+
+    private void copyDrbdNodeIdIfExists(Resource rsc, LayerPayload payload) throws ImplementationError
+    {
+        Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+            getLayerData(rsc),
+            DeviceLayerKind.DRBD
+        );
+        if (drbdRscDataSet.size() >= 2)
+        {
+            throw new ImplementationError("Unexpected layer tree");
+        }
+        if (!drbdRscDataSet.isEmpty())
+        {
+            DrbdRscData<Resource> drbdRscData = (DrbdRscData<Resource>) drbdRscDataSet.iterator().next();
+            payload.drbdRsc.replacingOldLayerRscId = drbdRscData.getRscLayerId();
+            payload.drbdRsc.nodeId = drbdRscData.getNodeId().value;
+        }
+    }
+
+    private void copyDrbdTcpPortsIfExists(Resource rsc, LayerPayload payload) throws ImplementationError
+    {
+        Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+            getLayerData(rsc),
+            DeviceLayerKind.DRBD
+        );
+        if (!drbdRscDataSet.isEmpty())
+        {
+            DrbdRscData<Resource> drbdRscData = (DrbdRscData<Resource>) drbdRscDataSet.iterator().next();
+            Collection<TcpPortNumber> tcpPorts = drbdRscData.getTcpPortList();
+            if (tcpPorts != null && !tcpPorts.isEmpty())
+            {
+                Set<Integer> portInts = new TreeSet<>();
+                for (TcpPortNumber port : tcpPorts)
+                {
+                    portInts.add(port.value);
+                }
+                payload.drbdRsc.tcpPorts = portInts;
+            }
+        }
+    }
+
+    private List<DeviceLayerKind> removeLayerData(Resource rscRef)
+    {
+        List<DeviceLayerKind> layerList;
+        try
+        {
+            layerList = LayerRscUtils.getLayerStack(rscRef);
+            AbsRscLayerObject<Resource> layerData = rscRef.getLayerData();
+            layerData.delete();
+            rscRef.setLayerData(null);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+        return layerList;
+    }
+
+    private boolean isSharedSpAlreadyUsed(Resource rscRef, StorPool sp)
+    {
+        boolean sharedSPAlreadyInUse = false;
+        if (sp.isShared())
+        {
+            SharedStorPoolName sharedStorPoolName = sp.getSharedStorPoolName();
+            ResourceDefinition rscDfn = rscRef.getResourceDefinition();
+            Iterator<Resource> rscIt = rscDfn.iterateResource();
+            while (rscIt.hasNext())
+            {
+                Resource otherRsc = rscIt.next();
+                if (!otherRsc.equals(rscRef))
+                {
+                    Set<StorPool> otherStorPools = LayerVlmUtils.getStorPools(otherRsc);
+                    for (StorPool otherStorPool : otherStorPools)
+                    {
+                        if (otherStorPool.getSharedStorPoolName().equals(sharedStorPoolName))
+                        {
+                            sharedSPAlreadyInUse = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return sharedSPAlreadyInUse;
+    }
+
+    // Restart from here when connection established and flag set
+    private Flux<ApiCallRc> updateAndAdjustDisk(
+        NodeName nodeName,
+        ResourceName rscName,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        ResponseContext context
+    )
+    {
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Update for disk toggle",
+                createLockGuard(),
+                () -> updateAndAdjustDiskInTransaction(nodeName, rscName, toggleOpRef, context)
+            );
+    }
+
+    private Flux<ApiCallRc> updateAndAdjustDiskInTransaction(
+        NodeName nodeName,
+        ResourceName rscName,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        ResponseContext context
+    )
+    {
+        Flux<ApiCallRc> responses;
+
+        Resource rsc = ctrlApiDataLoader.loadRsc(nodeName, rscName);
+
+        ApiCallRcImpl offlineWarnings = new ApiCallRcImpl();
+
+        Node node = rsc.getNode();
+        if (node.getPeer().getConnectionStatus() != ApiConsts.ConnectionStatus.ONLINE)
+        {
+            offlineWarnings.addEntry(ResponseUtils.makeNotConnectedWarning(node.getName()));
+        }
+
+        // Don't start the operation if any of the required nodes are offline
+        if (!offlineWarnings.isEmpty())
+        {
+            responses = Flux.just(offlineWarnings);
+        }
+        else
+        {
+            if (toggleOpRef.removeDisk)
+            {
+                markDiskRemoving(rsc, toggleOpRef);
+            }
+            else
+            {
+                markDiskAdding(rsc);
+                handleMixedStoragePool(rsc);
+            }
+
+            ctrlTransactionHelper.commit();
+
+            String actionSelf = toggleOpRef.removeDisk ? "Removed disk on {0}" : null;
+            String actionPeer = toggleOpRef.removeDisk ?
+                null :
+                "Prepared {0} to expect disk on ''" + nodeName.displayValue + "''";
+            Flux<ApiCallRc> nextStep = finishOperation(nodeName, rscName, toggleOpRef, context);
+            Flux<ApiCallRc> satelliteUpdateResponses = ctrlSatelliteUpdateCaller.updateSatellites(
+                    rsc.getResourceDefinition(), CtrlSatelliteUpdateCaller.notConnectedIgnoreIfNot(nodeName), nextStep)
+                .transform(updateResponses -> CtrlResponseUtils.combineResponses(
+                    errorReporter,
+                    updateResponses,
+                    rscName,
+                    Collections.singleton(nodeName),
+                    actionSelf,
+                    actionPeer
+                ));
+
+            responses = satelliteUpdateResponses
+                // If an update fails (e.g. the connection to a node is lost), attempt to reset back to the
+                // initial state. The requested flag is not reset, so the operation will be retried when the
+                // nodes are next all connected.
+                // There is no point attempting to reset a disk removal because the underlying storage volume
+                // may have been removed.
+                .transform(
+                    flux -> toggleOpRef.removeDisk ?
+                        flux :
+                        flux.onErrorResume(
+                            error -> resetDiskAdding(nodeName, rscName)
+                                .concatWith(Flux.error(error))
+                        )
+                )
+                .concatWith(nextStep)
+                .onErrorResume(CtrlResponseUtils.DelayedApiRcException.class, ignored -> Flux.empty());
+        }
+
+        return responses;
+    }
+
+    private void handleMixedStoragePool(Resource rscRef)
+    {
+        Iterator<Volume> vlmsIt = rscRef.iterateVolumes();
+        try
+        {
+            while (vlmsIt.hasNext())
+            {
+                Volume vlm = vlmsIt.next();
+                mixedStorPoolHelper.handleMixedStoragePools(vlm);
+            }
+        }
+        catch (StorageException exc)
+        {
+            throw new ApiRcException(
+                ApiCallRcImpl.simpleEntry(
+                    ApiConsts.FAIL_UNKNOWN_ERROR,
+                    "An error occurred while checking for mixed storage setups"
+                ),
+                exc
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    private Flux<ApiCallRc> resetDiskAdding(NodeName nodeName, ResourceName rscName)
+    {
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Reset disk adding",
+                createLockGuard(),
+                () -> resetDiskAddingInTransaction(nodeName, rscName)
+            );
+    }
+
+    private Flux<ApiCallRc> resetDiskAddingInTransaction(
+        NodeName nodeName,
+        ResourceName rscName
+    )
+    {
+        Resource rsc = ctrlApiDataLoader.loadRsc(nodeName, rscName);
+
+        unmarkDiskAdding(rsc);
+
+        ctrlTransactionHelper.commit();
+
+        Flux<ApiCallRc> satelliteUpdateResponses = ctrlSatelliteUpdateCaller.updateSatellites(rsc, Flux.empty())
+            .transform(responses -> CtrlResponseUtils.combineResponses(
+                errorReporter,
+                responses,
+                rscName,
+                "Diskless state temporarily reset on {0}"
+            ));
+
+        return satelliteUpdateResponses
+            .onErrorResume(CtrlResponseUtils.DelayedApiRcException.class, ignored -> Flux.empty());
+    }
+
+    private Flux<ApiCallRc> finishOperation(
+        NodeName nodeName,
+        ResourceName rscName,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        ResponseContext context
+    )
+    {
+        return scopeRunner
+            .fluxInTransactionalScope(
+                "Finish disk toggle",
+                createLockGuard(),
+                () -> finishOperationInTransaction(nodeName, rscName, toggleOpRef, context)
+            );
+    }
+
+    private Flux<ApiCallRc> finishOperationInTransaction(
+        NodeName nodeName,
+        ResourceName rscName,
+        CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef,
+        ResponseContext context
+    )
+    {
+        ApiCallRcImpl responses = new ApiCallRcImpl();
+
+        Resource rsc = ctrlApiDataLoader.loadRsc(nodeName, rscName);
+
+        List<DeviceLayerKind> layerList = null;
+        LayerPayload payload = new LayerPayload();
+        Flux<ApiCallRc> activateFlux = Flux.empty();
+        if (toggleOpRef.removeDisk)
+        {
+            markDiskRemoved(rsc);
+
+            activateFlux = activateIfPossible(rsc);
+            /*
+             * We also have to remove the possible meta-children of previous StorageRscData.
+             * LayerData will be recreated with ensureStackDataExists.
+             * However, we still need to remember our DRBD settings if we had / have DRBD in the list
+             */
+            copyDrbdSettings(rsc, payload);
+            layerList = removeLayerData(rsc);
+        }
+        else
+        {
+            markDiskAdded(rsc);
+            // Pass false to skip redundant ensureStackDataExists call within resetStoragePools,
+            // since we call it explicitly below with the correct payload
+            ctrlLayerStackHelper.resetStoragePools(rsc, false);
+        }
+        ctrlLayerStackHelper.ensureStackDataExists(rsc, layerList, payload);
+
+        Flux<ApiCallRc> autoFlux = rscAutoHelper.get().manage(
+            new AutoHelperContext(responses, context, rsc.getResourceDefinition())
+        ).flux();
+
+        ctrlTransactionHelper.commit();
+
+        autoDiskfulTaskProvider.get().update(rsc);
+
+        String actionSelf = toggleOpRef.removeDisk ? null : "Added disk on {0}";
+        String actionPeer = toggleOpRef.removeDisk ?
+            "Notified {0} that disk has been removed on ''" + nodeName.displayValue + "''" : null;
+        Publisher<ApiCallRc> migrationFlux;
+        ReadOnlyProps rscProps = getPropsPrivileged(rsc);
+        String migrateFromNodeNameStr = rscProps.map().get(ApiConsts.KEY_RSC_MIGRATE_FROM);
+        if (migrateFromNodeNameStr == null)
+        {
+            migrationFlux = Flux.empty();
+        }
+        else
+        {
+            migrationFlux = waitForMigration(
+                context,
+                nodeName,
+                rscName,
+                ctrlApiDataLoader.loadNode(migrateFromNodeNameStr).getName()
+            );
+        }
+
+        return Flux
+            .<ApiCallRc>just(responses)
+            .concatWith(activateFlux)
+            .concatWith(
+                ctrlSatelliteUpdateCaller.updateSatellites(
+                    rsc.getResourceDefinition(),
+                    CtrlSatelliteUpdateCaller.notConnectedErrorForNodesWarnForOthers(nodeName),
+                    migrationFlux
+                )
+                .transform(updateResponses -> CtrlResponseUtils.combineResponses(
+                    errorReporter,
+                    updateResponses,
+                    rscName,
+                    Collections.singleton(nodeName),
+                    actionSelf,
+                    actionPeer
+                )))
+            .concatWith(migrationFlux)
+            .concatWith(autoFlux);
+    }
+
+    private Flux<ApiCallRc> activateIfPossible(Resource rsc)
+    {
+        Flux<ApiCallRc> ret = Flux.empty();
+        StateFlags<Flags> rscFlags = rsc.getStateFlags();
+        if (
+            rscFlags.isSet(Resource.Flags.INACTIVE) &&
+            !rscFlags.isSet(Resource.Flags.INACTIVE_PERMANENTLY)
+        )
+        {
+            ret = ctrlRscActivateApiCallHandler.activateRsc(
+                rsc.getNode().getName().displayValue,
+                rsc.getResourceDefinition().getName().displayValue
+            );
+        }
+        return ret;
+    }
+
+    private boolean isSharedSourceStorPool(Resource rsc)
+    {
+        boolean ret = false;
+        Set<StorPool> storPools = LayerVlmUtils.getStorPools(rsc);
+        for (StorPool sp : storPools)
+        {
+            if (isSharedSpAlreadyUsed(rsc, sp))
+            {
+                ret = true;
+                break;
+            }
+        }
+        return ret;
+    }
+
+    Publisher<ApiCallRc> waitForMigration(
+        ResponseContext contextRef,
+        NodeName nodeName,
+        ResourceName rscName,
+        NodeName migrateFromNodeName
+    )
+    {
+        Mono<Tuple2<ResourceState, ResourceState>> migratedAndNotInUse = Mono.zip(
+            eventWaiter.waitForStream(
+                    resourceStateEvent.get(),
+                    ObjectIdentifier.resource(nodeName, rscName)
+                )
+                .skipUntil(usageState -> usageState.getUpToDate())
+                .next(),
+            eventWaiter.waitForStream(
+                    resourceStateEvent.get(),
+                    ObjectIdentifier.resource(migrateFromNodeName, rscName)
+                )
+                .skipUntil(usageState -> usageState.getInUse() != null && !usageState.getInUse())
+                .next()
+        );
+
+        return Mono.fromRunnable(() -> backgroundRunner.runInBackground(
+            "Migrate '" + rscName + "' from '" + migrateFromNodeName + "' to '" + nodeName + "'",
+            migratedAndNotInUse
+                .thenMany(scopeRunner.fluxInTransactionalScope(
+                    "Delete after migrate",
+                    lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.RSC_DFN_MAP),
+                    () -> startDeletionInTransaction(contextRef, nodeName, rscName, migrateFromNodeName)
+                ))
+                .onErrorResume(PeerNotConnectedException.class, ignored -> Flux.empty())
+        ));
+    }
+
+    private Flux<ApiCallRc> startDeletionInTransaction(
+        ResponseContext contextRef,
+        NodeName nodeName,
+        ResourceName rscName,
+        NodeName migrateFromNodeName
+    )
+    {
+        Resource rsc = ctrlApiDataLoader.loadRsc(nodeName, rscName);
+        @Nullable Resource migrateFromRsc = ctrlApiDataLoader.loadRscOrNull(migrateFromNodeName, rscName);
+
+        getPropsPrivileged(rsc).map().remove(ApiConsts.KEY_RSC_MIGRATE_FROM);
+
+        Flux<ApiCallRc> deleteFlux;
+        if (migrateFromRsc == null)
+        {
+            deleteFlux = Flux.empty();
+        }
+        else
+        {
+            ctrlRscDeleteApiHelper.markDeletedWithVolumes(migrateFromRsc);
+            deleteFlux = ctrlRscDeleteApiHelper.updateSatellitesForResourceDelete(
+                contextRef,
+                Collections.singleton(migrateFromNodeName),
+                rscName
+            );
+        }
+
+        ctrlTransactionHelper.commit();
+
+        return deleteFlux;
+    }
+
+    private int countDisksAndIsOnline(ResourceDefinition rscDfn)
+    {
+        int haveDiskCount = 0;
+        Iterator<Resource> rscIter = rscDfn.iterateResource();
+        while (rscIter.hasNext())
+        {
+            Resource rsc = rscIter.next();
+            if (!ctrlVlmCrtApiHelper.isDiskless(rsc) &&
+                rsc.getNode().getPeer().getConnectionStatus() == ApiConsts.ConnectionStatus.ONLINE)
+            {
+                haveDiskCount++;
+            }
+        }
+        return haveDiskCount;
+    }
+
+    private boolean hasDiskAddRequested(Resource rsc)
+    {
+        boolean set;
+        set = rsc.getStateFlags().isSet(Resource.Flags.DISK_ADD_REQUESTED);
+        return set;
+    }
+
+    private boolean hasDiskRemoveRequested(Resource rsc)
+    {
+        boolean set;
+        set = rsc.getStateFlags().isSet(Resource.Flags.DISK_REMOVE_REQUESTED);
+        return set;
+    }
+
+    private void markDiskAddRequested(Resource rsc)
+    {
+        try
+        {
+            rsc.getStateFlags().enableFlags(Resource.Flags.DISK_ADD_REQUESTED);
+        }
+        catch (DatabaseException sqlExc)
+        {
+            throw new ApiDatabaseException(sqlExc);
+        }
+    }
+
+    private void setMigrateFrom(Resource rsc, NodeName migrateFromNodeName)
+    {
+        rsc.getProps().map().put(ApiConsts.KEY_RSC_MIGRATE_FROM, migrateFromNodeName.value);
+    }
+
+    private void removeDiskfulByProp(Resource rscRef)
+    {
+        try
+        {
+            rscRef.getProps().removeProp(ApiConsts.KEY_RSC_DISKFUL_BY);
+        }
+        catch (InvalidKeyException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    private void setDiskfulByProp(Resource rscRef, @Nullable DiskfulBy diskfulByRef)
+    {
+        try
+        {
+            Props rscProp = rscRef.getProps();
+            if (diskfulByRef != null)
+            {
+                rscProp.setProp(ApiConsts.KEY_RSC_DISKFUL_BY, diskfulByRef.getValue());
+            }
+            else
+            {
+                rscProp.removeProp(ApiConsts.KEY_RSC_DISKFUL_BY);
+            }
+        }
+        catch (InvalidKeyException | InvalidValueException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ApiDatabaseException(exc);
+        }
+    }
+
+    private void markDiskRemoveRequested(Resource rsc)
+    {
+        try
+        {
+            rsc.getStateFlags().enableFlags(Resource.Flags.DISK_REMOVE_REQUESTED);
+        }
+        catch (DatabaseException sqlExc)
+        {
+            throw new ApiDatabaseException(sqlExc);
+        }
+    }
+
+    private void markDiskAdding(Resource rsc)
+    {
+        try
+        {
+            rsc.getStateFlags().enableFlags(Resource.Flags.DISK_ADDING);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void markDiskRemoving(Resource rsc, CtrlRscToggleDiskApiCallHandler.ToggleOp toggleOpRef)
+    {
+        try
+        {
+            rsc.getStateFlags().enableFlags(
+                toggleOpRef == ToggleOp.INTO_DRBD_TIEBREAKER ?
+                    Resource.Flags.TIE_BREAKER :
+                    Resource.Flags.DRBD_DISKLESS,
+                Resource.Flags.DISK_REMOVING
+            );
+            if (toggleOpRef == ToggleOp.INTO_DRBD_CLIENT)
+            {
+                Set<AbsRscLayerObject<Resource>> drbdRscDataSet = LayerRscUtils.getRscDataByLayer(
+                    rsc.getLayerData(),
+                    DeviceLayerKind.DRBD
+                );
+                for (AbsRscLayerObject<Resource> drbdRscObj : drbdRscDataSet)
+                {
+                    DrbdRscData<Resource> drbdRscData = (DrbdRscData<Resource>) drbdRscObj;
+                    drbdRscData.getFlags().enableFlags(DrbdRscFlags.CLIENT);
+                }
+            }
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void unmarkDiskAdding(Resource rsc)
+    {
+        try
+        {
+            rsc.getStateFlags().disableFlags(Resource.Flags.DISK_ADDING);
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void markDiskAdded(Resource rscData)
+    {
+        try
+        {
+            rscData.getStateFlags().disableFlags(
+                Resource.Flags.DRBD_DISKLESS,
+                Resource.Flags.DISK_ADDING,
+                Resource.Flags.DISK_ADD_REQUESTED
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private void markDiskRemoved(Resource rscData)
+    {
+        try
+        {
+            rscData.getStateFlags().disableFlags(
+                Resource.Flags.DISK_REMOVING,
+                Resource.Flags.DISK_REMOVE_REQUESTED
+            );
+        }
+        catch (DatabaseException exc)
+        {
+            throw new ImplementationError(exc);
+        }
+    }
+
+    private Props getPropsPrivileged(Resource rsc)
+    {
+        Props props;
+        props = rsc.getProps();
+        return props;
+    }
+
+    static AbsRscLayerObject<Resource> getLayerData(Resource rsc)
+    {
+        AbsRscLayerObject<Resource> layerData;
+        layerData = rsc.getLayerData();
+        return layerData;
+    }
+
+    private LockGuard createLockGuard()
+    {
+        return lockGuardFactory.buildDeferred(LockType.WRITE, LockObj.NODES_MAP, LockObj.RSC_DFN_MAP);
+    }
+}
